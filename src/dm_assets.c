@@ -222,6 +222,8 @@ typedef struct {
     DWORD pcm_bytes;
     WAVEFORMATEX fmt;
     LONG refs;
+    LPDIRECTSOUNDBUFFER ds_buf;
+    volatile LONG ds_building;
 } MusicCacheEnt;
 static MusicCacheEnt g_music_cache[MUSIC_CACHE_N];
 static int g_music_cache_n;
@@ -275,6 +277,10 @@ static int music_cache_evict_one_unlocked(void)
     }
     if (i >= g_music_cache_n)
         return 0;
+    if (g_music_cache[i].ds_buf) {
+        IDirectSoundBuffer_Release(g_music_cache[i].ds_buf);
+        g_music_cache[i].ds_buf = NULL;
+    }
     free(g_music_cache[i].pcm);
     if (g_music_cache_bytes >= g_music_cache[i].pcm_bytes)
         g_music_cache_bytes -= g_music_cache[i].pcm_bytes;
@@ -459,6 +465,167 @@ void music_cache_collect(void)
     LeaveCriticalSection(&g_music_cs);
 }
 
+static int music_list_mission_files(char names[][80], int maxn)
+{
+    const char *root;
+    char pat[MAX_PATH];
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    int n = 0;
+
+    if (!names || maxn < 1)
+        return 0;
+    root = dm_game_dir();
+    if (!root || !root[0])
+        return 0;
+    snprintf(pat, sizeof(pat), "%smusic\\*.ogg", root);
+    h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        snprintf(pat, sizeof(pat), "%smusic/*.ogg", root);
+        h = FindFirstFileA(pat, &fd);
+    }
+    if (h == INVALID_HANDLE_VALUE)
+        return 0;
+    do {
+        const char *name = fd.cFileName;
+        if (!name || !name[0] || name[0] == '_')
+            continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            continue;
+        strncpy(names[n], name, 79);
+        names[n][79] = '\0';
+        n++;
+        if (n >= maxn)
+            break;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return n;
+}
+
+static int music_cache_build_ds_unlocked(MusicCacheEnt *ent, LPDIRECTSOUND ds,
+                                         LPDIRECTSOUNDBUFFER *out_buf)
+{
+    DSBUFFERDESC desc;
+    LPDIRECTSOUNDBUFFER buf = NULL;
+    HRESULT hr;
+
+    if (out_buf)
+        *out_buf = NULL;
+    if (!ent || !ds || !ent->pcm || !ent->pcm_bytes)
+        return 0;
+    if (ent->ds_buf) {
+        if (out_buf) {
+            *out_buf = ent->ds_buf;
+            IDirectSoundBuffer_AddRef(*out_buf);
+        }
+        return 1;
+    }
+
+    memset(&desc, 0, sizeof(desc));
+    desc.dwSize = sizeof(desc);
+    desc.dwFlags = DSBCAPS_LOCSOFTWARE | DSBCAPS_CTRLVOLUME | DSBCAPS_GLOBALFOCUS |
+                   DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_STATIC;
+    desc.dwBufferBytes = ent->pcm_bytes;
+    desc.lpwfxFormat = &ent->fmt;
+    hr = IDirectSound_CreateSoundBuffer(ds, &desc, &buf, NULL);
+    if (SUCCEEDED(hr) && buf) {
+        if (!ds_buf_write_all(buf, ent->pcm, ent->pcm_bytes)) {
+            IDirectSoundBuffer_Release(buf);
+            buf = NULL;
+        }
+    }
+    if (buf && out_buf) {
+        *out_buf = buf;
+        return 1;
+    }
+    if (buf)
+        IDirectSoundBuffer_Release(buf);
+    return 0;
+}
+
+int music_cache_build_ds_for_path(LPDIRECTSOUND ds, const char *path)
+{
+    char key[260];
+    BYTE *pcm = NULL;
+    DWORD pcm_bytes = 0;
+    WAVEFORMATEX fmt;
+    LPDIRECTSOUNDBUFFER built = NULL;
+    MusicCacheEnt tmp;
+    int i, ok = 0;
+
+    if (!ds || !path || !path[0])
+        return 0;
+    music_path_key(path, key, sizeof(key));
+    music_cache_ensure_cs();
+    EnterCriticalSection(&g_music_cs);
+    for (i = 0; i < g_music_cache_n; ++i) {
+        if (strcmp(g_music_cache[i].path, key) == 0) {
+            if (g_music_cache[i].ds_buf) {
+                LeaveCriticalSection(&g_music_cs);
+                return 1;
+            }
+            if (InterlockedCompareExchange(&g_music_cache[i].ds_building, 1, 0) != 0) {
+                LeaveCriticalSection(&g_music_cs);
+                return 0;
+            }
+            pcm = g_music_cache[i].pcm;
+            pcm_bytes = g_music_cache[i].pcm_bytes;
+            fmt = g_music_cache[i].fmt;
+            LeaveCriticalSection(&g_music_cs);
+            goto build;
+        }
+    }
+    LeaveCriticalSection(&g_music_cs);
+    return 0;
+
+build:
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.pcm = pcm;
+    tmp.pcm_bytes = pcm_bytes;
+    tmp.fmt = fmt;
+    ok = music_cache_build_ds_unlocked(&tmp, ds, &built);
+
+    music_cache_ensure_cs();
+    EnterCriticalSection(&g_music_cs);
+    for (i = 0; i < g_music_cache_n; ++i) {
+        if (strcmp(g_music_cache[i].path, key) == 0) {
+            if (ok && built && !g_music_cache[i].ds_buf && g_music_cache[i].pcm == pcm)
+                g_music_cache[i].ds_buf = built;
+            else if (built)
+                IDirectSoundBuffer_Release(built);
+            ok = g_music_cache[i].ds_buf != NULL;
+            InterlockedExchange(&g_music_cache[i].ds_building, 0);
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_music_cs);
+    return ok;
+}
+
+int music_cache_try_acquire_ds_buf(const char *path, LPDIRECTSOUNDBUFFER *out)
+{
+    char key[260];
+    int i, ok = 0;
+
+    if (out)
+        *out = NULL;
+    if (!path || !out)
+        return 0;
+    music_path_key(path, key, sizeof(key));
+    music_cache_ensure_cs();
+    EnterCriticalSection(&g_music_cs);
+    for (i = 0; i < g_music_cache_n; ++i) {
+        if (strcmp(g_music_cache[i].path, key) == 0 && g_music_cache[i].ds_buf) {
+            *out = g_music_cache[i].ds_buf;
+            IDirectSoundBuffer_AddRef(*out);
+            ok = 1;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_music_cs);
+    return ok;
+}
+
 static BYTE *music_cache_upgrade(const char *path, const WAVEFORMATEX *fmt, BYTE *pcm,
                                  DWORD pcm_bytes)
 {
@@ -491,6 +658,10 @@ static BYTE *music_cache_upgrade(const char *path, const WAVEFORMATEX *fmt, BYTE
                 g_music_cache_bytes -= g_music_cache[i].pcm_bytes;
             else
                 g_music_cache_bytes = 0;
+            if (g_music_cache[i].ds_buf) {
+                IDirectSoundBuffer_Release(g_music_cache[i].ds_buf);
+                g_music_cache[i].ds_buf = NULL;
+            }
             if (g_music_cache[i].pcm != pcm)
                 free(g_music_cache[i].pcm);
             g_music_cache[i].fmt = *fmt;
@@ -542,10 +713,20 @@ static DWORD WINAPI music_prefetch_full_proc(void *arg)
     t0 = hitch_qpc_now();
     if (SUCCEEDED(load_wav_file_or_pak(path, &raw, &raw_len)) && raw &&
         decode_to_pcm(raw, raw_len, &fmt, &pcm, &pcm_len, OGG_DECODE_FULL) && pcm) {
+        CkPerf *perf;
         pcm = music_cache_upgrade(path, &fmt, pcm, pcm_len);
         ms = hitch_qpc_ms_since(t0);
         log_msg("dm-replace: music prefetch full '%s' pcm=%lu ms=%.1f", path,
                 (unsigned long)pcm_len, ms);
+        live_cs_enter();
+        perf = g_active_perf;
+        if (perf)
+            ck_perf_addref(perf);
+        live_cs_leave();
+        if (perf && perf->ds)
+            music_cache_build_ds_for_path(perf->ds, path);
+        if (perf)
+            ck_perf_release(perf);
     }
 out:
     free(raw);
@@ -627,10 +808,27 @@ static int music_preload_one(const char *rel, int *n_ok, int *n_skip, int *n_fai
 
 static DWORD WINAPI music_preload_proc(void *arg)
 {
-    int n_ok = 0, n_skip = 0, n_fail = 0;
+    char names[64][80];
+    int n, i, n_ok = 0, n_skip = 0, n_fail = 0;
     HMODULE module = (HMODULE)arg;
-    /* Only warm menu BGM. Full-folder preload (~800MB PCM) OOMs 32-bit and skips tpw*. */
+    CkPerf *perf;
+
     music_preload_one("music\\_menu.ogg", &n_ok, &n_skip, &n_fail);
+    n = music_list_mission_files(names, 64);
+    for (i = 0; i < n; ++i) {
+        char rel[260];
+        snprintf(rel, sizeof(rel), "music\\%s", names[i]);
+        music_preload_one(rel, &n_ok, &n_skip, &n_fail);
+        live_cs_enter();
+        perf = g_active_perf;
+        if (perf)
+            ck_perf_addref(perf);
+        live_cs_leave();
+        if (perf && perf->ds)
+            music_cache_build_ds_for_path(perf->ds, rel);
+        if (perf)
+            ck_perf_release(perf);
+    }
     log_msg("dm-replace: music preload done ok=%d skip=%d fail=%d cached=%d bytes=%lu", n_ok, n_skip,
             n_fail, g_music_cache_n, (unsigned long)g_music_cache_bytes);
     dm_worker_exit(module, 0);

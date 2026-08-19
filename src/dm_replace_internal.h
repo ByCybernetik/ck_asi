@@ -267,6 +267,8 @@ void music_cache_collect(void);
 void music_preload_start(void);
 void music_prefetch_full_async(const char *path);
 void music_prefetch_siblings(const char *current_rel);
+int music_cache_build_ds_for_path(LPDIRECTSOUND ds, const char *path);
+int music_cache_try_acquire_ds_buf(const char *path, LPDIRECTSOUNDBUFFER *out);
 void ensure_game_dir(void);
 const char *dm_game_dir(void);
 int scrape_stream_path(void *stream, char *out, size_t outn);

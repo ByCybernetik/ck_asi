@@ -1006,7 +1006,7 @@ void music_prefetch_siblings(const char *current_rel)
 {
     char pool[MUSIC_POOL_MAX][80];
     char rel[260];
-    int n, i, prefetched, start;
+    int n, i, start;
 
     n = music_fill_pool(pool, MUSIC_POOL_MAX);
     if (n < 1)
@@ -1016,8 +1016,7 @@ void music_prefetch_siblings(const char *current_rel)
         g_music_rand_seeded = 1;
     }
     start = n > 1 ? (rand() % n) : 0;
-    prefetched = 0;
-    for (i = 0; i < n && prefetched < 2; ++i) {
+    for (i = 0; i < n; ++i) {
         const char *fname = pool[(start + i) % n];
         snprintf(rel, sizeof(rel), "music\\%s", fname);
         if (current_rel && current_rel[0]) {
@@ -1045,7 +1044,6 @@ void music_prefetch_siblings(const char *current_rel)
                 continue;
         }
         music_prefetch_full_async(rel);
-        prefetched++;
     }
 }
 
@@ -1426,6 +1424,125 @@ static void music_release_old(LPDIRECTSOUNDBUFFER buf, CkSegment *seg, int fade,
     free(ctx);
 }
 
+typedef struct {
+    CkPerf *perf;
+    CkSegment *seg;
+    DWORD flags;
+    LONG pvol;
+    HMODULE module;
+} MusicPlayJob;
+
+static HRESULT play_pcm_music_start(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags,
+                                    LONG pvol, LPDIRECTSOUNDBUFFER buf, int loop_play)
+{
+    LPDIRECTSOUNDBUFFER old_buf;
+    CkSegment *old_seg;
+    HRESULT hr;
+    int fade_transition = (flags & CK_PLAY_FADE_TRANSITION) != 0;
+
+    if (!buf)
+        return E_FAIL;
+    IDirectSoundBuffer_SetCurrentPosition(buf, 0);
+    path_apply_buf_vol(buf, pvol);
+    hr = IDirectSoundBuffer_Play(buf, 0, 0, loop_play ? DSBPLAY_LOOPING : 0);
+    if (FAILED(hr)) {
+        IDirectSoundBuffer_Release(buf);
+        return hr;
+    }
+    EnterCriticalSection(&perf->lock);
+    old_buf = perf->music_buf;
+    old_seg = perf->music_seg;
+    perf->music_buf = buf;
+    perf->music_seg = seg;
+    ck_segment_addref(seg);
+    perf->music_path_id = apath ? apath->id : 0;
+    LeaveCriticalSection(&perf->lock);
+    music_release_old(old_buf, old_seg, fade_transition, pvol);
+    {
+        DWORD md = seg->fmt.nAvgBytesPerSec
+                       ? (DWORD)((ULONGLONG)seg->pcm_bytes * 1000ull / seg->fmt.nAvgBytesPerSec)
+                       : 1000u;
+        music_note_started(seg->path, loop_play, md, pvol, 0);
+        if (!loop_play && !music_path_is_menu(seg->path))
+            music_prefetch_siblings(seg->path);
+    }
+    return S_OK;
+}
+
+static HRESULT play_pcm_music_sync(CkPerf *perf, CkSegment *seg, DWORD flags, LONG pvol)
+{
+    DSBUFFERDESC desc;
+    LPDIRECTSOUNDBUFFER buf = NULL;
+    HRESULT hr;
+    int loop_play = seg->repeats == (DWORD)-1;
+
+    if (music_cache_try_acquire_ds_buf(seg->path, &buf) && buf)
+        return play_pcm_music_start(perf, seg, NULL, flags, pvol, buf, loop_play);
+
+    memset(&desc, 0, sizeof(desc));
+    desc.dwSize = sizeof(desc);
+    desc.dwFlags = DSBCAPS_LOCSOFTWARE | DSBCAPS_CTRLVOLUME | DSBCAPS_GLOBALFOCUS |
+                   DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_STATIC;
+    desc.dwBufferBytes = seg->pcm_bytes;
+    desc.lpwfxFormat = &seg->fmt;
+    hr = IDirectSound_CreateSoundBuffer(perf->ds, &desc, &buf, NULL);
+    if (FAILED(hr) || !buf)
+        return hr;
+    if (!ds_buf_write_all(buf, seg->pcm, seg->pcm_bytes)) {
+        IDirectSoundBuffer_Release(buf);
+        return E_FAIL;
+    }
+    return play_pcm_music_start(perf, seg, NULL, flags, pvol, buf, loop_play);
+}
+
+static DWORD WINAPI music_async_play_proc(void *arg)
+{
+    MusicPlayJob *job = (MusicPlayJob *)arg;
+    play_pcm_music_sync(job->perf, job->seg, job->flags, job->pvol);
+    ck_segment_release(job->seg);
+    ck_perf_release(job->perf);
+    {
+        HMODULE module = job->module;
+        free(job);
+        dm_worker_exit(module, 0);
+    }
+    return 0;
+}
+
+static HRESULT music_play_async(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags, LONG pvol)
+{
+    MusicPlayJob *job;
+    HANDLE th;
+
+    job = (MusicPlayJob *)calloc(1, sizeof(*job));
+    if (!job)
+        return E_OUTOFMEMORY;
+    ck_perf_addref(perf);
+    ck_segment_addref(seg);
+    job->perf = perf;
+    job->seg = seg;
+    job->flags = flags;
+    job->pvol = pvol;
+    job->module = dm_pin_module((const void *)music_async_play_proc);
+    if (!job->module) {
+        ck_segment_release(seg);
+        ck_perf_release(perf);
+        free(job);
+        return E_OUTOFMEMORY;
+    }
+    th = CreateThread(NULL, 0, music_async_play_proc, job, 0, NULL);
+    if (!th) {
+        FreeLibrary(job->module);
+        ck_segment_release(seg);
+        ck_perf_release(perf);
+        free(job);
+        return play_pcm_music_sync(perf, seg, flags, pvol);
+    }
+    CloseHandle(th);
+    (void)apath;
+    return S_OK;
+}
+
 HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
 {
     DSBUFFERDESC desc;
@@ -1455,6 +1572,15 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
     /* H-M1: do not force-loop all music — only SetRepeats(-1). */
     loop_play = seg->repeats == (DWORD)-1;
     pvol = apath ? InterlockedCompareExchange(&apath->vol, 0, 0) : 0;
+
+    if (is_music) {
+        LPDIRECTSOUNDBUFFER cached = NULL;
+        music_cache_build_ds_for_path(perf->ds, seg->path);
+        if (music_cache_try_acquire_ds_buf(seg->path, &cached) && cached)
+            return play_pcm_music_start(perf, seg, apath, flags, pvol, cached, loop_play);
+        return music_play_async(perf, seg, apath, flags, pvol);
+    }
+
     if (!is_music && apath && apath->id)
         path_stop_live_sfx(apath->id);
     now = GetTickCount();
@@ -1562,26 +1688,8 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
 
     if (SUCCEEDED(hr) && buf) {
         if (is_music) {
-            LPDIRECTSOUNDBUFFER old_buf;
-            CkSegment *old_seg;
-            EnterCriticalSection(&perf->lock);
-            old_buf = perf->music_buf;
-            old_seg = perf->music_seg;
-            perf->music_buf = buf;
-            perf->music_seg = seg;
-            ck_segment_addref(seg);
-            perf->music_path_id = apath ? apath->id : 0;
-            buf = NULL;
-            LeaveCriticalSection(&perf->lock);
-            music_release_old(old_buf, old_seg, fade_transition, pvol);
-            {
-                DWORD md = seg->fmt.nAvgBytesPerSec
-                               ? (DWORD)((ULONGLONG)seg->pcm_bytes * 1000ull / seg->fmt.nAvgBytesPerSec)
-                               : 1000u;
-                music_note_started(seg->path, loop_play, md, pvol, 0);
-                if (!loop_play && path_is_music(seg->path) && !music_path_is_menu(seg->path))
-                    music_prefetch_siblings(seg->path);
-            }
+            /* Unreachable — music returns earlier. */
+            IDirectSoundBuffer_Release(buf);
         } else {
             live_cs_enter();
             if (s_live_n >= (int)(sizeof(s_live) / sizeof(s_live[0])))
