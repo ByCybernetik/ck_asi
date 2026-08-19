@@ -2,6 +2,14 @@
 #define VK_SOFT_OVERLAY_H
 
 #include <stdint.h>
+
+#ifdef NO_GPU_SCENE
+
+static inline int  vk_soft_overlay_wanted(void) { return 0; }
+static inline void vk_soft_overlay_shutdown(void) {}
+
+#else /* !NO_GPU_SCENE */
+
 #include <vulkan/vulkan.h>
 
 /*
@@ -25,4 +33,5 @@ int vk_soft_overlay_ensure(int soft_w, int soft_h);
 int vk_soft_overlay_record(VkCommandBuffer cmd, VkImage soft_img, VkImageView soft_view,
                            VkBuffer soft_upload, int soft_w, int soft_h);
 
+#endif /* NO_GPU_SCENE */
 #endif

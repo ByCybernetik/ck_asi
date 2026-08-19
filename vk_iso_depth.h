@@ -2,6 +2,13 @@
 #define VK_ISO_DEPTH_H
 
 #include <stdint.h>
+
+#ifdef NO_GPU_SCENE
+
+static inline void vk_iso_depth_shutdown(void)  {}
+
+#else /* !NO_GPU_SCENE */
+
 #include <vulkan/vulkan.h>
 
 /* Shared D16 depth for GPU decor+obj isometric occlusion (sort_y → Z).
@@ -21,4 +28,5 @@ void vk_iso_depth_clear(VkCommandBuffer cmd);
 
 VkFormat vk_iso_depth_format(void);
 
+#endif /* NO_GPU_SCENE */
 #endif

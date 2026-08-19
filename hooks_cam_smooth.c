@@ -6,9 +6,7 @@
 
 #include <stdio.h>
 
-/* Avoid vk_terrain.h (pulls vulkan.h); only need GPU-draw gate for CamLight. */
-int vk_terrain_ready(void);
-int vk_terrain_draw_enabled(void);
+#include "vk_terrain.h"
 
 /*
  * Keyboard pan: CenterOn only, present-dt integrated, soft step cap.

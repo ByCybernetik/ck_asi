@@ -4,10 +4,12 @@ AS      := i686-w64-mingw32-gcc
 STRIP   := i686-w64-mingw32-strip
 
 CFLAGS  := -O2 -Wall -Wextra -Wno-cast-function-type -Wno-unused-function \
-           -DWINVER=0x0501 -D_WIN32_WINNT=0x0501 -mcrtdll=msvcrt-os
+           -DWINVER=0x0501 -D_WIN32_WINNT=0x0501 -mcrtdll=msvcrt-os \
+           $(NO_GPU_SCENE_FLAG)
 CXXFLAGS := -O2 -Wall -Wextra -std=c++17 \
            -DWINVER=0x0601 -D_WIN32_WINNT=0x0601 \
-           -fno-exceptions -fno-rtti
+           -fno-exceptions -fno-rtti \
+           $(NO_GPU_SCENE_FLAG)
 # Note: no -mcrtdll=msvcrt-os here — old CRT lacks at_quick_exit needed by libstdc++.
 VK_CFLAGS := -idirafter /usr/include
 LDFLAGS := -shared -static-libgcc -static-libstdc++ \
@@ -20,6 +22,8 @@ LDFLAGS_STATIC_PTHREAD := -Wl,-Bstatic -lstdc++ -lwinpthread -Wl,-Bdynamic
 FT_DIR     := deps/freetype
 FT_CFLAGS  := -I$(FT_DIR)/include
 FT_LIBS    := -L$(FT_DIR)/lib -lfreetype
+
+GPU_SCENE ?= 1
 
 GAME_DIR ?= ../Imperivm
 GAME_DIR_I2 ?= ../Imperivm 2
@@ -39,12 +43,21 @@ MENU_OBJS := menu/ck_menu_host.o \
              menu/nm_ini_file.o menu/nm_dialog.o \
              menu/iconv_stub.o
 
+GPU_SCENE_OBJS := ktx_gpu_terrain.o vk_terrain.o vk_iso_depth.o \
+                  vk_decor.o vk_obj.o vk_soft_overlay.o
+
+ifeq ($(GPU_SCENE),0)
+  NO_GPU_SCENE_FLAG := -DNO_GPU_SCENE
+  GPU_SCENE_OBJS :=
+endif
+
 ASI_OBJS := dllmain.o log.o hooks.o hooks_patch.o hooks_util.o hooks_scanline.o \
             hooks_vfs_map.o hooks_hitch.o hooks_terrain.o hooks_minimap.o hooks_zoom.o \
             hooks_cam_smooth.o \
             hooks_player_color.o hooks_video.o hooks_native_menu.o hooks_obj.o \
-            ktx_terrain.o ktx_decor.o decor_spawn.o ktx_obj.o obj_spawn.o obj_player.o             ktx_gpu_terrain.o ktx_vq_replace.o vk_terrain.o vk_iso_depth.o \
-            vk_decor.o vk_obj.o vk_soft_overlay.o vk_present.o tip_font.o movie_player.o movie_webm.o hitch.o \
+            ktx_terrain.o ktx_decor.o decor_spawn.o ktx_obj.o obj_spawn.o obj_player.o \
+            ktx_vq_replace.o $(GPU_SCENE_OBJS) \
+            vk_present.o tip_font.o movie_player.o movie_webm.o hitch.o \
             dm_native.o dm_trace.o stb_vorbis.o \
             dm_replace.o dm_guids.o dm_globals.o dm_debug.o dm_pcm.o \
             dm_voice.o dm_assets.o dm_com.o \

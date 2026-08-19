@@ -8,13 +8,8 @@
 #include <stdio.h>
 #include <string.h>
 
-/* From vk_terrain.c / vk_obj.c — avoid pulling vulkan.h into this TU. */
-int vk_terrain_draw_enabled(void);
-int vk_terrain_soft_land_disabled(void);
-int vk_obj_atlas_fits_array(int atlas_index);
-int vk_obj_atlas_resident(int atlas_index);
-void vk_obj_request_atlas(int atlas_index);
-void vk_obj_request_id(const char *id);
+#include "vk_terrain.h"
+#include "vk_obj.h"
 int ktx_obj_id_fits_gpu(const char *id);
 int ktx_obj_id_needs_soft_pc(const char *id);
 
