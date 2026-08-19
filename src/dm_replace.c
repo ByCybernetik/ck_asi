@@ -1,4 +1,5 @@
 #include "dm_replace_internal.h"
+#include "hooks_internal.h"
 
 /*
  * DirectMusic replace entry: CoCreate Loader+Perf stubs, InitAudio → DS,
@@ -7,20 +8,19 @@
 
 void dm_replace_install(void)
 {
+    const char *e = NULL;
     char envbuf[32];
     DWORD nenv = GetEnvironmentVariableA("CK_DM_REPLACE", envbuf, (DWORD)sizeof(envbuf));
-    const char *e = NULL;
+
     /*
-     * Default OFF. Runtime+RE (Celtic_Kings ds8.cpp): our COM stub crashes after the first
-     * Segment::SetRepeats (AV execute @ 0xFFFFFE0C / SEH). Game already ships DX dmusic DLLs;
-     * dm_native redirects CoCreate/LoadLibrary there. Set CK_DM_REPLACE=1 only to test the stub.
-     * Prefer Win32 GetEnvironmentVariableA — Wine often does not expose Unix env to CRT getenv.
+     * Default ON — DirectMusic COM stub + DirectSound playback.
+     * Set CK_DM_REPLACE=0 to use native / game dmusic DLLs via dm_native instead.
      */
+    g_enabled = env_on("CK_DM_REPLACE", 1);
     if (nenv > 0 && nenv < sizeof(envbuf))
         e = envbuf;
     else
         e = getenv("CK_DM_REPLACE");
-    g_enabled = (e && (e[0] == '1') && e[1] == '\0');
     if (!g_live_cs_ok) {
         InitializeCriticalSection(&g_live_cs);
         InterlockedExchange(&g_live_cs_ok, 1);
@@ -36,8 +36,7 @@ void dm_replace_install(void)
     }
     /* #endregion */
     if (!g_enabled) {
-        log_msg("dm-replace: disabled (default) — using dm_native / game dmusic DLLs; "
-                "CK_DM_REPLACE=1 to force stub");
+        log_msg("dm-replace: disabled (CK_DM_REPLACE=0) — using dm_native / game dmusic DLLs");
         return;
     }
     init_vtables();
@@ -50,6 +49,34 @@ int dm_replace_enabled(void)
     return g_enabled;
 }
 
+HMODULE dm_pin_module(const void *address)
+{
+    HMODULE module = NULL;
+    if (!address ||
+        !GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                            (LPCSTR)address, &module))
+        return NULL;
+    return module;
+}
+
+void dm_worker_exit(HMODULE module, DWORD code)
+{
+    if (module)
+        FreeLibraryAndExitThread(module, code);
+    ExitThread(code);
+}
+
+void dm_replace_shutdown(void)
+{
+    if (!g_enabled)
+        return;
+    beacon_stop();
+    stop_all_live_sfx();
+    stop_music_buf();
+    dm_com_collect_all();
+    g_enabled = 0;
+}
+
 HRESULT dm_replace_cocreate(REFCLSID clsid, REFIID iid, void **ppv)
 {
     if (!g_enabled || !clsid || !ppv)
@@ -58,6 +85,11 @@ HRESULT dm_replace_cocreate(REFCLSID clsid, REFIID iid, void **ppv)
     init_vtables();
 
     if (IsEqualGUID(clsid, &CLSID_DMPerformance)) {
+        if (iid && !IsEqualGUID(iid, &IID_IUnknown) &&
+            !IsEqualGUID(iid, &IID_IDirectMusicPerformance) &&
+            !IsEqualGUID(iid, &IID_IDirectMusicPerformance2) &&
+            !IsEqualGUID(iid, &IID_IDirectMusicPerformance8))
+            return E_NOINTERFACE;
         CkPerf *p = (CkPerf *)calloc(1, sizeof(*p));
         if (!p)
             return E_OUTOFMEMORY;
@@ -65,19 +97,21 @@ HRESULT dm_replace_cocreate(REFCLSID clsid, REFIID iid, void **ppv)
         p->refs = 1;
         InitializeCriticalSection(&p->lock);
         *ppv = p;
-        (void)iid;
         dm_agent("R0", "dm_replace.c:cocreate", "cocreate-perf", "{\"ok\":1}");
         log_msg("dm-replace: CoCreate Performance stub %p", (void *)p);
         return S_OK;
     }
     if (IsEqualGUID(clsid, &CLSID_DMLoader)) {
+        if (iid && !IsEqualGUID(iid, &IID_IUnknown) &&
+            !IsEqualGUID(iid, &IID_IDirectMusicLoader) &&
+            !IsEqualGUID(iid, &IID_IDirectMusicLoader8))
+            return E_NOINTERFACE;
         CkLoader *l = (CkLoader *)calloc(1, sizeof(*l));
         if (!l)
             return E_OUTOFMEMORY;
         l->lpVtbl = g_ldr_vt;
         l->refs = 1;
         *ppv = l;
-        (void)iid;
         dm_agent("R0", "dm_replace.c:cocreate", "cocreate-loader", "{\"ok\":1}");
         log_msg("dm-replace: CoCreate Loader stub %p", (void *)l);
         return S_OK;

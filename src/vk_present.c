@@ -552,8 +552,10 @@ static void destroy_soft_gpu(void)
     if (g.soft_view) {
         if (g.soft_view_local && g.fn.vkDestroyImageView)
             g.fn.vkDestroyImageView(g.device, g.soft_view, NULL);
+#ifndef NO_GPU_SCENE
         else
             vk_terrain_destroy_soft_view(g.soft_view);
+#endif
         g.soft_view = VK_NULL_HANDLE;
         g.soft_view_local = 0;
     }
@@ -571,6 +573,7 @@ static int ensure_soft_view(void)
         return 1;
     if (!g.soft_img || !g.device || !g.fn.vkCreateImageView)
         return 0;
+#ifndef NO_GPU_SCENE
     if (vk_terrain_ready()) {
         g.soft_view = vk_terrain_create_soft_view(g.soft_img, g.swap_fmt);
         g.soft_view_local = 0;
@@ -579,6 +582,7 @@ static int ensure_soft_view(void)
             return 1;
         }
     }
+#endif
     memset(&vci, 0, sizeof(vci));
     vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     vci.image = g.soft_img;
@@ -717,8 +721,10 @@ static int ensure_soft_gpu(int w, int h)
     if (g.soft_view) {
         if (g.soft_view_local && g.fn.vkDestroyImageView)
             g.fn.vkDestroyImageView(g.device, g.soft_view, NULL);
+#ifndef NO_GPU_SCENE
         else
             vk_terrain_destroy_soft_view(g.soft_view);
+#endif
         g.soft_view = VK_NULL_HANDLE;
         g.soft_view_local = 0;
     }
@@ -1501,6 +1507,7 @@ static int vk_init(HWND hwnd)
         return 0;
     }
 
+#ifndef NO_GPU_SCENE
     if (vk_terrain_wanted()) {
         vk_terrain_note_device(g.device, g.phys, g.queue, g.qfam, g.swap_fmt, g.vkGetDeviceProcAddr,
                                g.vkGetInstanceProcAddr, g.instance);
@@ -1517,6 +1524,9 @@ static int vk_init(HWND hwnd)
     } else {
         log_msg("vk_present: vk_terrain skipped (OVERPAINT/BLEND off)");
     }
+#else
+    log_msg("vk_present: GPU scene disabled (NO_GPU_SCENE build)");
+#endif
 
     g.ready = 1;
     log_msg("vk_present: ready hwnd=%p extent=%ux%u fmt=%d", (void *)hwnd, g.extent.width,
@@ -2047,11 +2057,13 @@ static int present_fb(double *out_fence_ms, double *out_compose_ms, double *out_
     {
         double pump_ms = 0, terr_ms = 0, decor_ms = 0, obj_ms = 0, ov_ms = 0;
         LONGLONG tp;
+#ifndef NO_GPU_SCENE
         if (ktx_obj_wanted() && !ck_soft_obj_enabled()) {
             tp = hitch_qpc_now();
             vk_obj_pump_uploads();
             pump_ms = hitch_qpc_ms_since(tp);
         }
+#endif
         memset(&bi, 0, sizeof(bi));
         bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -2088,6 +2100,7 @@ static int present_fb(double *out_fence_ms, double *out_compose_ms, double *out_
         /* Optional GPU terrain (F8) and/or KTX decor overpaint into soft_img.
          * Soft mode (F8 off): retail PutDecor only — do not GPU-overpaint decors. */
         {
+#ifndef NO_GPU_SCENE
             int want_terrain = vk_terrain_ready() && vk_terrain_draw_enabled();
             int want_decor = want_terrain; /* KTX decor with GPU terrain only */
             if ((want_terrain || want_decor) && g.soft_img)
@@ -2239,6 +2252,7 @@ static int present_fb(double *out_fence_ms, double *out_compose_ms, double *out_
                                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1,
                                           &barrs[0]);
             } else {
+#endif /* !NO_GPU_SCENE */
                 /* soft DST→SRC ; swap UNDEFINED→DST */
                 memset(barrs, 0, sizeof(barrs));
                 barrs[0] = barr;
@@ -2256,7 +2270,9 @@ static int present_fb(double *out_fence_ms, double *out_compose_ms, double *out_
                 g.fn.vkCmdPipelineBarrier(g.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2,
                                           barrs);
+#ifndef NO_GPU_SCENE
             }
+#endif
         }
 
         memset(&clear, 0, sizeof(clear));

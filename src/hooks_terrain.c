@@ -8,9 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 
-/* From vk_terrain.c — avoid pulling vulkan.h into this TU. */
-int vk_terrain_draw_enabled(void);
-int vk_terrain_soft_land_disabled(void);
+#include "vk_terrain.h"
 
 /* When GPU-first / F8 GPU on, skip retail soft land draws (H-SOFT).
  * Opt out: CK_GPU_KEEP_SOFT_LAND=1. F8→SOFT re-enables soft land. */

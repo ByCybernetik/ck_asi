@@ -2,24 +2,13 @@
 
 void dm_agent(const char *hid, const char *loc, const char *msg, const char *data_json)
 {
-    FILE *df;
-    /* #region agent log — crash/VEH must reach debug NDJSON (stub hid crashes) */
     if (!msg)
         return;
     if (strcmp(msg, "crash-veh") && strcmp(msg, "crash-other") && strcmp(msg, "crash-ctx") &&
         strcmp(msg, "call-ring"))
         return;
-    df = fopen("/home/cybernetik/Games/Imperivm/ck_asi/.cursor/debug-764ba7.log", "a");
-    if (!df)
-        return;
-    fprintf(df,
-            "{\"sessionId\":\"764ba7\",\"runId\":\"crash-cap\",\"hypothesisId\":\"%s\","
-            "\"location\":\"%s\",\"message\":\"%s\",\"data\":%s,\"timestamp\":%lu}\n",
-            hid ? hid : "?", loc ? loc : "?", msg,
-            data_json && data_json[0] ? data_json : "{}",
-            (unsigned long)(hitch_qpc_now() / 10000));
-    fclose(df);
-    /* #endregion */
+    log_msg("dm-agent: id=%s loc=%s msg=%s data=%s", hid ? hid : "?", loc ? loc : "?",
+            msg, data_json && data_json[0] ? data_json : "{}");
 }
 
 /* #region agent log — last COM hits before AV (no I/O on hot path) */

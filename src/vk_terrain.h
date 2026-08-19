@@ -2,6 +2,20 @@
 #define VK_TERRAIN_H
 
 #include <stdint.h>
+
+#ifdef NO_GPU_SCENE
+
+static inline int  vk_terrain_wanted(void)            { return 0; }
+static inline void vk_terrain_shutdown(void)           {}
+static inline int  vk_terrain_ready(void)              { return 0; }
+static inline int  vk_terrain_draw_enabled(void)       { return 0; }
+static inline int  vk_terrain_soft_land_disabled(void) { return 0; }
+static inline int  vk_terrain_has_map(void)            { return 0; }
+static inline void vk_terrain_poll_toggle(void)        {}
+static inline void vk_terrain_note_anim_tick(void)     {}
+
+#else /* !NO_GPU_SCENE */
+
 #include <vulkan/vulkan.h>
 
 /* CK_GPU_TERRAIN_OVERPAINT=1: AABB quads into soft_img (NOT texture replace).
@@ -32,4 +46,5 @@ void vk_terrain_destroy_soft_view(VkImageView view);
 int vk_terrain_record(VkCommandBuffer cmd, VkImage soft_img, VkImageView soft_view, int soft_w,
                       int soft_h);
 
+#endif /* NO_GPU_SCENE */
 #endif

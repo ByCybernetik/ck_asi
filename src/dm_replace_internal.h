@@ -22,9 +22,6 @@
 #include <ctype.h>
 
 enum {
-    OGG_DECODE_MAX_SEC = 30,
-    /* Deprecated: head-only music truncates the DS buffer (~16s). Always use FULL for BGM. */
-    OGG_DECODE_MUSIC_HEAD_SEC = 16,
     OGG_DECODE_FULL = -1
 };
 
@@ -65,7 +62,8 @@ enum {
 
 #define CK_DMUS_PMSGT_NOTIFICATION 3u
 #define CK_DMUS_NOTIFICATION_SEGEND 1u
-#define CK_NOTIF_SLOTS 32
+#define CK_PLAY_FADE_TRANSITION 0x40000000u
+#define CK_NOTIF_SLOTS 128
 
 #define CK_CAM_PTR_VA 0x007CA604u
 #define CK_CAM_LEFT_OFF 0x4C8u
@@ -80,12 +78,16 @@ extern const GUID CLSID_DMPerformance;
 extern const GUID CLSID_DMLoader;
 extern const GUID CLSID_DMSegment;
 extern const GUID IID_IDirectMusicPerformance8;
+extern const GUID IID_IDirectMusicPerformance;
+extern const GUID IID_IDirectMusicPerformance2;
 extern const GUID IID_IDirectMusicLoader8;
+extern const GUID IID_IDirectMusicLoader;
 extern const GUID IID_IDirectMusicSegment8;
 extern const GUID IID_IDirectMusicSegmentState8;
+extern const GUID IID_IDirectMusicAudioPath8;
 extern const GUID CK_GUID_NOTIFICATION_SEGMENT;
 
-typedef struct {
+typedef struct CkSegmentTag {
     void **lpVtbl;
     LONG refs;
     BYTE *pcm;
@@ -93,7 +95,11 @@ typedef struct {
     WAVEFORMATEX fmt;
     void *last_path;
     DWORD repeats;
-    char path[200];
+    int pcm_cached;
+    int unloaded;
+    LONG destroying;
+    struct CkSegmentTag *registry_next;
+    char path[260];
 } CkSegment;
 
 typedef struct {
@@ -105,6 +111,8 @@ typedef struct {
     void *ctrl_proxy;
     LONG vol;
     LONG pan;
+    LONG volume_generation;
+    int active;
 } CkPath;
 
 typedef struct {
@@ -156,10 +164,15 @@ typedef struct {
     LPDIRECTSOUND ds;
     LPDIRECTSOUNDBUFFER primary;
     LPDIRECTSOUNDBUFFER music_buf;
+    CkSegment *music_seg;
+    DWORD music_path_id;
+    DWORD clock_start_ms;
     HWND hwnd;
     CRITICAL_SECTION lock;
     HANDLE notif_event;
     int notif_segment;
+    int music_wasapi;
+    CkState *pending_music_state;
     CkNotifSlot notif[CK_NOTIF_SLOTS];
 } CkPerf;
 
@@ -214,6 +227,8 @@ void dm_agent(const char *hid, const char *loc, const char *msg, const char *dat
 void ck_ring_push(int kind, int slot);
 void ck_ring_dump(const char *why);
 LONG CALLBACK ck_veh(struct _EXCEPTION_POINTERS *ep);
+HMODULE dm_pin_module(const void *address);
+void dm_worker_exit(HMODULE module, DWORD code);
 
 /* ---- pcm / path classifiers ---- */
 LONG path_clamp_vol(LONG vol);
@@ -242,21 +257,30 @@ int path_want_spatial(const char *p);
 /* ---- assets / decode ---- */
 int decode_to_pcm(const BYTE *raw, DWORD raw_len, WAVEFORMATEX *fmt, BYTE **pcm_out,
                   DWORD *pcm_len, int max_sec);
-int make_silent_pcm(WAVEFORMATEX *fmt, BYTE **pcm_out, DWORD *pcm_len);
 int cache_get(const char *path, WAVEFORMATEX *fmt, BYTE **pcm, DWORD *pcm_bytes);
 void cache_put(const char *path, const WAVEFORMATEX *fmt, const BYTE *pcm, DWORD pcm_bytes);
 int music_cache_get(const char *path, WAVEFORMATEX *fmt, BYTE **pcm, DWORD *pcm_bytes);
+int music_cache_acquire(const char *path, WAVEFORMATEX *fmt, BYTE **pcm, DWORD *pcm_bytes);
 BYTE *music_cache_intern(const char *path, const WAVEFORMATEX *fmt, BYTE *pcm, DWORD pcm_bytes);
-/* Replace cache entry when new PCM is larger (old buffer leaked if still referenced). */
-BYTE *music_cache_upgrade(const char *path, const WAVEFORMATEX *fmt, BYTE *pcm, DWORD pcm_bytes);
-/* Background full-track decode after a head decode on the main thread. */
-void music_prefetch_full_async(const char *path);
+BYTE *music_cache_intern_acquire(const char *path, const WAVEFORMATEX *fmt, BYTE *pcm,
+                                 DWORD pcm_bytes, int *cached);
+void music_cache_release(const char *path, const BYTE *pcm);
+void music_cache_collect(void);
 void music_preload_start(void);
+void music_prefetch_full_async(const char *path);
+void music_prefetch_siblings(const char *current_rel);
+int music_cache_build_ds_for_path(LPDIRECTSOUND ds, const char *path);
+int music_cache_try_acquire_ds_buf(const char *path, LPDIRECTSOUNDBUFFER *out);
+int audio_wasapi_init(HWND hwnd);
+void audio_wasapi_shutdown(void);
+int audio_wasapi_play_ogg(const BYTE *ogg_data, DWORD ogg_len, int loop, LONG vol, DWORD *duration_ms_out);
+void audio_wasapi_stop(void);
+int audio_wasapi_is_playing(void);
+void audio_wasapi_set_volume(LONG vol);
 void ensure_game_dir(void);
 const char *dm_game_dir(void);
 int scrape_stream_path(void *stream, char *out, size_t outn);
 HRESULT load_wav_file_or_pak(const char *path, BYTE **out, DWORD *out_len);
-HRESULT read_istream_all(void *stream, BYTE **out, DWORD *out_len);
 
 /* ---- voice / spatial / play ---- */
 void install_onscreen_pan_fix(void);
@@ -275,11 +299,18 @@ void path_stop_live_sfx(DWORD path_id);
 void live_cs_enter(void);
 void live_cs_leave(void);
 void live_free_slot(int i);
+int segment_is_playing(CkSegment *seg);
 HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags);
 
 /* ---- COM ---- */
 void init_vtables(void);
 void notif_schedule_segend(CkPerf *perf, CkState *st, DWORD dur_ms);
+void notif_tick(CkPerf *perf);
 void state_init(CkState *st, CkSegment *seg, DWORD repeats);
+ULONG ck_segment_addref(CkSegment *seg);
+ULONG ck_segment_release(CkSegment *seg);
+ULONG ck_perf_addref(CkPerf *perf);
+ULONG ck_perf_release(CkPerf *perf);
+void dm_com_collect_all(void);
 
 #endif /* CK_DM_REPLACE_INTERNAL_H */

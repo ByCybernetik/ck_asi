@@ -2,6 +2,19 @@
 #define VK_OBJ_H
 
 #include <stdint.h>
+
+#ifdef NO_GPU_SCENE
+
+static inline void vk_obj_shutdown(void)                    {}
+static inline int  vk_obj_ready(void)                       { return 0; }
+static inline int  vk_obj_atlas_fits_array(int i)           { (void)i; return 0; }
+static inline int  vk_obj_atlas_resident(int i)             { (void)i; return 0; }
+static inline void vk_obj_request_atlas(int i)              { (void)i; }
+static inline void vk_obj_request_id(const char *id)        { (void)id; }
+static inline void vk_obj_pump_uploads(void)                {}
+
+#else /* !NO_GPU_SCENE */
+
 #include <vulkan/vulkan.h>
 
 /* GPU buildings/units overpaint (BC3 atlas). Draws on soft_img after soft blit
@@ -34,4 +47,5 @@ void vk_obj_pump_uploads(void);
 int vk_obj_record(VkCommandBuffer cmd, VkImage soft_img, VkImageView soft_view,
                   VkImageView depth_view, int soft_w, int soft_h);
 
+#endif /* NO_GPU_SCENE */
 #endif

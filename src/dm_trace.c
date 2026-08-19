@@ -1,4 +1,5 @@
 #include "dm_trace.h"
+#include "hooks_internal.h"
 #include "log.h"
 
 #include <windows.h>
@@ -227,8 +228,6 @@ static int open_probe_file(const char *path, HANDLE *out)
         {
             static const char *bases[] = {
                 "assets_unpacked\\",
-                "Z:\\home\\cybernetik\\Games\\Imperivm\\Imperivm\\assets_unpacked\\",
-                "/home/cybernetik/Games/Imperivm/Imperivm/assets_unpacked/",
                 NULL};
             char full[640];
             for (i = 0; bases[i]; ++i) {
@@ -1006,8 +1005,7 @@ void dm_trace_on_cocreate(REFCLSID clsid, void *iface)
 
 void dm_trace_install(void)
 {
-    const char *rep = getenv("CK_DM_REPLACE");
-    int native = !(rep && rep[0] == '1' && rep[1] == '\0');
+    int native = !env_on("CK_DM_REPLACE", 1);
     g_dm_run_id = native ? "native-baseline" : "dm-replace-cocreate";
     /* #region agent log */
     {

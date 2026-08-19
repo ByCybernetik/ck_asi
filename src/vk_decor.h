@@ -2,6 +2,14 @@
 #define VK_DECOR_H
 
 #include <stdint.h>
+
+#ifdef NO_GPU_SCENE
+
+static inline void vk_decor_shutdown(void)  {}
+static inline int  vk_decor_ready(void)     { return 0; }
+
+#else /* !NO_GPU_SCENE */
+
 #include <vulkan/vulkan.h>
 
 /* GPU PutDecor overpaint (BC3 atlas). Draws on soft_img after soft blit
@@ -20,4 +28,5 @@ int vk_decor_ready(void);
 int vk_decor_record(VkCommandBuffer cmd, VkImage soft_img, VkImageView soft_view,
                     VkImageView depth_view, int soft_w, int soft_h);
 
+#endif /* NO_GPU_SCENE */
 #endif

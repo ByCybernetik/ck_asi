@@ -7,8 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Defined in vk_terrain.c — no vulkan.h needed here. */
-void vk_terrain_note_anim_tick(void);
+#include "vk_terrain.h"
 
 /* tpw.exe fixed VAs (ImageBase 0x400000). */
 enum {

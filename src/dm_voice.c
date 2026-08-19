@@ -352,29 +352,48 @@ static void music_tick(void);
 
 void dm_replace_beacon_tick(void)
 {
+    CkPerf *perf;
     InterlockedIncrement(&g_beacon_tick_n);
     if (g_beacon_L && g_beacon_R)
         beacon_apply_spatial(0);
     spatial_tick_live();
+    live_cs_enter();
+    perf = g_active_perf;
+    if (perf)
+        ck_perf_addref(perf);
+    live_cs_leave();
+    if (perf) {
+        notif_tick(perf);
+        ck_perf_release(perf);
+    }
     music_tick();
 }
 
 static DWORD WINAPI beacon_timer_proc(void *arg)
 {
-    (void)arg;
+    HMODULE module = (HMODULE)arg;
     while (InterlockedCompareExchange(&g_beacon_timer_run, 1, 1) == 1) {
         dm_replace_beacon_tick();
         Sleep(16);
     }
+    dm_worker_exit(module, 0);
     return 0;
 }
 
 static void beacon_timer_start(void)
 {
+    HMODULE module;
     if (g_beacon_timer)
         return;
+    module = dm_pin_module((const void *)beacon_timer_proc);
+    if (!module)
+        return;
     InterlockedExchange(&g_beacon_timer_run, 1);
-    g_beacon_timer = CreateThread(NULL, 0, beacon_timer_proc, NULL, 0, NULL);
+    g_beacon_timer = CreateThread(NULL, 0, beacon_timer_proc, module, 0, NULL);
+    if (!g_beacon_timer) {
+        InterlockedExchange(&g_beacon_timer_run, 0);
+        FreeLibrary(module);
+    }
 }
 
 static LPDIRECTSOUNDBUFFER beacon_make_half(LPDIRECTSOUND ds, const WAVEFORMATEX *wfx, BYTE *pcm,
@@ -439,7 +458,7 @@ void beacon_start_from_seg(CkPerf *perf, CkSegment *seg, CkPath *apath)
         return;
     }
 
-    base_vol = apath ? apath->vol : 0;
+    base_vol = apath ? InterlockedCompareExchange(&apath->vol, 0, 0) : 0;
     g_beacon_L = beacon_make_half(perf->ds, &wfx, left, stereo_bytes, base_vol, 1);
     g_beacon_R = beacon_make_half(perf->ds, &wfx, right, stereo_bytes, base_vol, 1);
     free(left);
@@ -450,7 +469,8 @@ void beacon_start_from_seg(CkPerf *perf, CkSegment *seg, CkPath *apath)
     }
 
     g_beacon_path_id = apath ? apath->id : 0;
-    g_beacon_last_game_pan = apath ? apath->pan : 0;
+    g_beacon_last_game_pan =
+        apath ? InterlockedCompareExchange(&apath->pan, 0, 0) : 0;
     g_beacon_last_applied = 0x7fffffff;
     g_beacon_last_yatten = 0x7fffffff;
     g_beacon_tick_n = 0;
@@ -496,6 +516,7 @@ void live_cs_leave(void)
 void live_free_slot(int i)
 {
     LPDIRECTSOUNDBUFFER b, bR;
+    CkSegment *seg;
 
     live_cs_enter();
     if (i < 0 || i >= s_live_n) {
@@ -504,6 +525,7 @@ void live_free_slot(int i)
     }
     b = s_live[i].b;
     bR = s_live[i].bR;
+    seg = s_live[i].seg;
     s_live[i].b = NULL;
     s_live[i].bR = NULL;
     s_live[i].spatial = 0;
@@ -519,6 +541,8 @@ void live_free_slot(int i)
         IDirectSoundBuffer_Stop(bR);
         IDirectSoundBuffer_Release(bR);
     }
+    if (seg)
+        ck_segment_release(seg);
 }
 
 void spatial_apply_live(CkLiveBuf *lb, int force)
@@ -578,6 +602,7 @@ static void spatial_tick_live(void)
 {
     int i;
     DWORD now = GetTickCount();
+    live_cs_enter();
     for (i = 0; i < s_live_n;) {
         if ((LONG)(now - s_live[i].done_tick) >= 0) {
             live_free_slot(i);
@@ -587,6 +612,7 @@ static void spatial_tick_live(void)
             spatial_apply_live(&s_live[i], 0);
         i++;
     }
+    live_cs_leave();
 }
 
 /* Dual L/R + camera spatial. loop=1 for long ambient beds; voices/buildings stay one-shot. */
@@ -603,9 +629,6 @@ int spatial_voice_play(CkPerf *perf, CkSegment *seg, CkPath *apath, int loop)
         return 0;
     if (seg->fmt.wBitsPerSample != 16)
         return 0;
-    if (s_live_n >= (int)(sizeof(s_live) / sizeof(s_live[0])))
-        return 0;
-
     stereo_wfx_from(&seg->fmt, &wfx);
     if (seg->fmt.nChannels == 1)
         stereo_bytes = (seg->pcm_bytes / 2u) * 4u;
@@ -627,7 +650,7 @@ int spatial_voice_play(CkPerf *perf, CkSegment *seg, CkPath *apath, int loop)
         return 0;
     }
 
-    base_vol = apath ? apath->vol : 0;
+    base_vol = apath ? InterlockedCompareExchange(&apath->vol, 0, 0) : 0;
     bL = beacon_make_half(perf->ds, &wfx, left, stereo_bytes, base_vol, loop);
     bR = beacon_make_half(perf->ds, &wfx, right, stereo_bytes, base_vol, loop);
     free(left);
@@ -648,6 +671,9 @@ int spatial_voice_play(CkPerf *perf, CkSegment *seg, CkPath *apath, int loop)
         dur_ms = 50u;
     dur_ms += 400u;
 
+    live_cs_enter();
+    if (s_live_n >= (int)(sizeof(s_live) / sizeof(s_live[0])))
+        live_free_slot(0);
     lb = &s_live[s_live_n];
     memset(lb, 0, sizeof(*lb));
     lb->b = bL;
@@ -655,6 +681,7 @@ int spatial_voice_play(CkPerf *perf, CkSegment *seg, CkPath *apath, int loop)
     lb->done_tick = loop ? (GetTickCount() + 3600000u) : (GetTickCount() + dur_ms);
     lb->path_id = apath ? apath->id : 0;
     lb->seg = seg;
+    ck_segment_addref(seg);
     lb->spatial = 1;
     lb->looping = loop ? 1 : 0;
     lb->base_vol = base_vol;
@@ -682,6 +709,7 @@ int spatial_voice_play(CkPerf *perf, CkSegment *seg, CkPath *apath, int loop)
     lb->ref_span = 0;
     s_live_n++;
     spatial_apply_live(lb, 1);
+    live_cs_leave();
     return 1;
 }
 
@@ -811,11 +839,28 @@ void path_propagate_volume(CkPath *path)
 
     if (!path)
         return;
-    vol = path_clamp_vol(path->vol);
+    vol = path_clamp_vol(InterlockedCompareExchange(&path->vol, 0, 0));
     if (path->ctrl)
         IDirectSoundBuffer_SetVolume(path->ctrl, vol);
-    if (path->id == 1 && g_active_perf && g_active_perf->music_buf)
-        IDirectSoundBuffer_SetVolume(g_active_perf->music_buf, vol);
+    {
+        CkPerf *perf;
+        live_cs_enter();
+        perf = g_active_perf;
+        if (perf)
+            ck_perf_addref(perf);
+        live_cs_leave();
+        if (perf) {
+        EnterCriticalSection(&perf->lock);
+        if (path->id == perf->music_path_id) {
+            extern void ck_music_set_volume(LONG);
+            ck_music_set_volume(vol);
+            if (perf->music_buf)
+                IDirectSoundBuffer_SetVolume(perf->music_buf, vol);
+        }
+        LeaveCriticalSection(&perf->lock);
+            ck_perf_release(perf);
+        }
+    }
     live_cs_enter();
     for (i = 0; i < s_live_n; i++) {
         if (s_live[i].path_id != path->id)
@@ -893,7 +938,7 @@ void path_propagate_pan(CkPath *path)
 
     if (!path)
         return;
-    pan = path_clamp_pan(path->pan);
+    pan = path_clamp_pan(InterlockedCompareExchange(&path->pan, 0, 0));
     if (path->ctrl)
         IDirectSoundBuffer_SetPan(path->ctrl, pan);
     live_cs_enter();
@@ -920,6 +965,8 @@ static int g_music_auto; /* non-menu one-shot → advance randomly */
 static LONG g_music_vol;
 static int g_music_rand_seeded;
 
+static int music_fill_pool(char names[][80], int maxn);
+
 static int music_path_is_menu(const char *path)
 {
     char t[260];
@@ -938,7 +985,7 @@ static int music_path_is_menu(const char *path)
     return strstr(t, "_MENU") != NULL;
 }
 
-static void music_note_started(const char *path, int loop, DWORD dur_ms, LONG vol)
+static void music_note_started(const char *path, int loop, DWORD dur_ms, LONG vol, int enable_auto)
 {
     g_music_vol = vol;
     g_music_looping = loop ? 1 : 0;
@@ -948,12 +995,60 @@ static void music_note_started(const char *path, int loop, DWORD dur_ms, LONG vo
     } else {
         g_music_last[0] = '\0';
     }
-    /* Menu (_menu) loops; mission BGM is one-shot + random next (original PlayRandomMusic). */
-    g_music_auto = (!loop && path && path[0] && !music_path_is_menu(path)) ? 1 : 0;
+    /*
+     * Mission BGM advances via SEGEND → game GetObject/PlaySegmentEx.
+     * Do not also auto-advance in music_tick (duplicate decode froze the render thread).
+     */
+    g_music_auto = enable_auto && (!loop && path && path[0] && !music_path_is_menu(path)) ? 1 : 0;
     if (g_music_auto)
         g_music_done_tick = GetTickCount() + (dur_ms > 50u ? dur_ms : 50u);
     else
         g_music_done_tick = 0;
+}
+
+void music_prefetch_siblings(const char *current_rel)
+{
+    char pool[MUSIC_POOL_MAX][80];
+    char rel[260];
+    int n, i, start;
+
+    n = music_fill_pool(pool, MUSIC_POOL_MAX);
+    if (n < 1)
+        return;
+    if (!g_music_rand_seeded) {
+        srand((unsigned)(GetTickCount() ^ GetCurrentThreadId()));
+        g_music_rand_seeded = 1;
+    }
+    start = n > 1 ? (rand() % n) : 0;
+    for (i = 0; i < n; ++i) {
+        const char *fname = pool[(start + i) % n];
+        snprintf(rel, sizeof(rel), "music\\%s", fname);
+        if (current_rel && current_rel[0]) {
+            char tcur[260], ttry[260];
+            size_t j;
+            for (j = 0; current_rel[j] && j + 1 < sizeof(tcur); ++j) {
+                char c = current_rel[j];
+                if (c >= 'a' && c <= 'z')
+                    c = (char)(c - 'a' + 'A');
+                if (c == '/')
+                    c = '\\';
+                tcur[j] = c;
+            }
+            tcur[j] = '\0';
+            for (j = 0; rel[j] && j + 1 < sizeof(ttry); ++j) {
+                char c = rel[j];
+                if (c >= 'a' && c <= 'z')
+                    c = (char)(c - 'a' + 'A');
+                if (c == '/')
+                    c = '\\';
+                ttry[j] = c;
+            }
+            ttry[j] = '\0';
+            if (strcmp(tcur, ttry) == 0)
+                continue;
+        }
+        music_prefetch_full_async(rel);
+    }
 }
 
 static void music_clear_state(void)
@@ -1041,7 +1136,7 @@ static int music_play_rel(CkPerf *perf, const char *fname)
         return 0;
     snprintf(rel, sizeof(rel), "music\\%s", fname);
     memset(&fmt, 0, sizeof(fmt));
-    if (music_cache_get(rel, &fmt, &pcm, &pcm_len)) {
+    if (music_cache_acquire(rel, &fmt, &pcm, &pcm_len)) {
         cached = 1;
     } else {
         LONGLONG t0 = hitch_qpc_now();
@@ -1055,7 +1150,7 @@ static int music_play_rel(CkPerf *perf, const char *fname)
         }
         free(raw);
         pcm = music_cache_intern(rel, &fmt, pcm, pcm_len);
-        cached = music_cache_get(rel, &fmt, &pcm, &pcm_len);
+        cached = music_cache_acquire(rel, &fmt, &pcm, &pcm_len);
         log_msg("dm-replace: random music decode '%s' ms=%.1f cached=%d pcm=%lu", rel,
                 hitch_qpc_ms_since(t0), cached, (unsigned long)pcm_len);
     }
@@ -1066,17 +1161,17 @@ static int music_play_rel(CkPerf *perf, const char *fname)
                    DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_STATIC;
     desc.dwBufferBytes = pcm_len;
     desc.lpwfxFormat = &fmt;
-    EnterCriticalSection(&perf->lock);
     hr = IDirectSound_CreateSoundBuffer(perf->ds, &desc, &buf, NULL);
     if (SUCCEEDED(hr) && buf) {
         if (!ds_buf_write_all(buf, pcm, pcm_len))
             hr = E_FAIL;
-        else
-            hr = IDirectSoundBuffer_Play(buf, 0, 0, 0);
-        if (SUCCEEDED(hr))
+        else {
             path_apply_buf_vol(buf, g_music_vol);
+            hr = IDirectSoundBuffer_Play(buf, 0, 0, 0);
+        }
     }
-    LeaveCriticalSection(&perf->lock);
+    if (cached)
+        music_cache_release(rel, pcm);
     /* Shared music-cache buffers must not be freed. */
     if (!cached && pcm)
         free(pcm);
@@ -1085,13 +1180,20 @@ static int music_play_rel(CkPerf *perf, const char *fname)
             IDirectSoundBuffer_Release(buf);
         return 0;
     }
+    EnterCriticalSection(&perf->lock);
     if (perf->music_buf) {
         IDirectSoundBuffer_Stop(perf->music_buf);
         IDirectSoundBuffer_Release(perf->music_buf);
     }
+    if (perf->music_seg)
+        ck_segment_release(perf->music_seg);
     perf->music_buf = buf;
+    perf->music_seg = NULL;
+    perf->music_path_id = 0;
+    LeaveCriticalSection(&perf->lock);
     dur_ms = fmt.nAvgBytesPerSec ? (DWORD)((ULONGLONG)pcm_len * 1000ull / fmt.nAvgBytesPerSec) : 1000u;
-    music_note_started(rel, 0, dur_ms, g_music_vol);
+    music_note_started(rel, 0, dur_ms, g_music_vol, 1);
+    music_prefetch_siblings(rel);
     log_msg("dm-replace: random music '%s' (%lu ms)%s", rel, (unsigned long)dur_ms,
             cached ? " [cache]" : "");
     return 1;
@@ -1123,25 +1225,58 @@ static void music_play_random_next(CkPerf *perf)
 
 static void music_tick(void)
 {
-    CkPerf *p = g_active_perf;
-    if (!g_music_auto || g_music_looping || !p || !p->music_buf)
+    CkPerf *p;
+    int should_advance = 0;
+    if (!g_music_auto || g_music_looping)
         return;
-    if ((LONG)(GetTickCount() - g_music_done_tick) < 0)
+    live_cs_enter();
+    p = g_active_perf;
+    if (p)
+        ck_perf_addref(p);
+    live_cs_leave();
+    if (!p)
         return;
-    /* Track finished — pick next like CVXMusicPlayer::PlayRandomMusic. */
-    music_play_random_next(p);
+    EnterCriticalSection(&p->lock);
+    should_advance = p->music_buf != NULL &&
+                     (LONG)(GetTickCount() - g_music_done_tick) >= 0;
+    LeaveCriticalSection(&p->lock);
+    if (should_advance)
+        music_play_random_next(p);
+    ck_perf_release(p);
 }
 
 /* H59: Unload/movie must tear down looping BGM — music lives outside s_live. */
 void stop_music_buf(void)
 {
-    CkPerf *p = g_active_perf;
+    CkPerf *p;
+    LPDIRECTSOUNDBUFFER buf;
+    CkSegment *seg;
     music_clear_state();
-    if (!p || !p->music_buf)
+    live_cs_enter();
+    p = g_active_perf;
+    if (p)
+        ck_perf_addref(p);
+    live_cs_leave();
+    if (!p)
         return;
-    IDirectSoundBuffer_Stop(p->music_buf);
-    IDirectSoundBuffer_Release(p->music_buf);
+    {
+        extern void ck_music_stop(void);
+        ck_music_stop();
+    }
+    EnterCriticalSection(&p->lock);
+    buf = p->music_buf;
+    seg = p->music_seg;
     p->music_buf = NULL;
+    p->music_seg = NULL;
+    p->music_path_id = 0;
+    LeaveCriticalSection(&p->lock);
+    if (buf) {
+        IDirectSoundBuffer_Stop(buf);
+        IDirectSoundBuffer_Release(buf);
+    }
+    if (seg)
+        ck_segment_release(seg);
+    ck_perf_release(p);
 }
 
 void dm_replace_silence_music(void)
@@ -1155,19 +1290,58 @@ void stop_live_for_segment(CkSegment *seg)
     int i;
     if (!seg)
         return;
+    live_cs_enter();
     for (i = 0; i < s_live_n;) {
         if (s_live[i].seg == seg)
             live_free_slot(i);
         else
             i++;
     }
+    live_cs_leave();
 }
 
 /* H55/H56: mission→menu or CloseDown — silence all secondary SFX. */
 void stop_all_live_sfx(void)
 {
+    live_cs_enter();
     while (s_live_n > 0)
         live_free_slot(0);
+    live_cs_leave();
+}
+
+int segment_is_playing(CkSegment *seg)
+{
+    int i, playing = 0;
+    CkPerf *perf;
+    if (!seg)
+        return 0;
+    live_cs_enter();
+    perf = g_active_perf;
+    if (perf)
+        ck_perf_addref(perf);
+    live_cs_leave();
+    if (perf) {
+        EnterCriticalSection(&perf->lock);
+        {
+            extern int ck_music_is_playing(void);
+            playing = (perf->music_seg == seg) && ck_music_is_playing();
+            if (!playing)
+                playing = perf->music_buf && perf->music_seg == seg;
+        }
+        LeaveCriticalSection(&perf->lock);
+        ck_perf_release(perf);
+    }
+    if (playing)
+        return 1;
+    live_cs_enter();
+    for (i = 0; i < s_live_n; ++i) {
+        if (s_live[i].seg == seg) {
+            playing = 1;
+            break;
+        }
+    }
+    live_cs_leave();
+    return playing;
 }
 
 /* Stop prior SFX on this audiopath — native channel re-triggers (H47). */
@@ -1176,12 +1350,261 @@ void path_stop_live_sfx(DWORD path_id)
     int i;
     if (!path_id)
         return;
+    live_cs_enter();
     for (i = 0; i < s_live_n;) {
         if (s_live[i].path_id == path_id)
             live_free_slot(i);
         else
             i++;
     }
+    live_cs_leave();
+}
+
+typedef struct {
+    LPDIRECTSOUNDBUFFER buf;
+    CkSegment *seg;
+    LONG start_vol;
+    HMODULE module;
+} CkMusicFade;
+
+static DWORD WINAPI music_fade_release_proc(void *arg)
+{
+    CkMusicFade *fade = (CkMusicFade *)arg;
+    int step;
+    for (step = 1; step <= 16; ++step) {
+        LONG vol = fade->start_vol + (DSBVOLUME_MIN - fade->start_vol) * step / 16;
+        IDirectSoundBuffer_SetVolume(fade->buf, path_clamp_vol(vol));
+        Sleep(16);
+    }
+    IDirectSoundBuffer_Stop(fade->buf);
+    IDirectSoundBuffer_Release(fade->buf);
+    if (fade->seg)
+        ck_segment_release(fade->seg);
+    {
+        HMODULE module = fade->module;
+        free(fade);
+        dm_worker_exit(module, 0);
+    }
+    return 0;
+}
+
+static void music_release_old(LPDIRECTSOUNDBUFFER buf, CkSegment *seg, int fade, LONG start_vol)
+{
+    CkMusicFade *ctx;
+    HANDLE thread;
+    if (!buf) {
+        if (seg)
+            ck_segment_release(seg);
+        return;
+    }
+    if (!fade) {
+        IDirectSoundBuffer_Stop(buf);
+        IDirectSoundBuffer_Release(buf);
+        if (seg)
+            ck_segment_release(seg);
+        return;
+    }
+    ctx = (CkMusicFade *)calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        IDirectSoundBuffer_Stop(buf);
+        IDirectSoundBuffer_Release(buf);
+        if (seg)
+            ck_segment_release(seg);
+        return;
+    }
+    ctx->buf = buf;
+    ctx->seg = seg;
+    ctx->start_vol = path_clamp_vol(start_vol);
+    ctx->module = dm_pin_module((const void *)music_fade_release_proc);
+    if (!ctx->module) {
+        IDirectSoundBuffer_Stop(buf);
+        IDirectSoundBuffer_Release(buf);
+        if (seg)
+            ck_segment_release(seg);
+        free(ctx);
+        return;
+    }
+    thread = CreateThread(NULL, 0, music_fade_release_proc, ctx, 0, NULL);
+    if (thread) {
+        CloseHandle(thread);
+        return;
+    }
+    IDirectSoundBuffer_Stop(buf);
+    IDirectSoundBuffer_Release(buf);
+    if (seg)
+        ck_segment_release(seg);
+    FreeLibrary(ctx->module);
+    free(ctx);
+}
+
+typedef struct {
+    CkPerf *perf;
+    CkSegment *seg;
+    DWORD flags;
+    LONG pvol;
+    HMODULE module;
+    CkState *state;
+} MusicPlayJob;
+
+static HRESULT play_pcm_music_start(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags,
+                                    LONG pvol, LPDIRECTSOUNDBUFFER buf, int loop_play)
+{
+    LPDIRECTSOUNDBUFFER old_buf;
+    CkSegment *old_seg;
+    HRESULT hr;
+    int fade_transition = (flags & CK_PLAY_FADE_TRANSITION) != 0;
+
+    if (!buf)
+        return E_FAIL;
+    IDirectSoundBuffer_SetCurrentPosition(buf, 0);
+    path_apply_buf_vol(buf, pvol);
+    hr = IDirectSoundBuffer_Play(buf, 0, 0, loop_play ? DSBPLAY_LOOPING : 0);
+    if (FAILED(hr)) {
+        IDirectSoundBuffer_Release(buf);
+        return hr;
+    }
+    EnterCriticalSection(&perf->lock);
+    old_buf = perf->music_buf;
+    old_seg = perf->music_seg;
+    perf->music_buf = buf;
+    perf->music_seg = seg;
+    ck_segment_addref(seg);
+    perf->music_path_id = apath ? apath->id : 0;
+    LeaveCriticalSection(&perf->lock);
+    music_release_old(old_buf, old_seg, fade_transition, pvol);
+    {
+        DWORD md = seg->fmt.nAvgBytesPerSec
+                       ? (DWORD)((ULONGLONG)seg->pcm_bytes * 1000ull / seg->fmt.nAvgBytesPerSec)
+                       : 1000u;
+        music_note_started(seg->path, loop_play, md, pvol, 0);
+        if (!loop_play && !music_path_is_menu(seg->path))
+            music_prefetch_siblings(seg->path);
+        if (!loop_play && md > 500u) {
+            CkState *pst = NULL;
+            EnterCriticalSection(&perf->lock);
+            pst = perf->pending_music_state;
+            perf->pending_music_state = NULL;
+            LeaveCriticalSection(&perf->lock);
+            if (pst) {
+                notif_schedule_segend(perf, pst, md);
+                InterlockedDecrement(&pst->refs);
+            }
+        }
+    }
+    return S_OK;
+}
+
+static HRESULT play_pcm_music_sync(CkPerf *perf, CkSegment *seg, DWORD flags, LONG pvol)
+{
+    DSBUFFERDESC desc;
+    LPDIRECTSOUNDBUFFER buf = NULL;
+    HRESULT hr;
+    int loop_play = seg->repeats == (DWORD)-1;
+
+    /* If segment has no PCM yet, load and decode now (on worker thread). */
+    if (!seg->pcm || !seg->pcm_bytes) {
+        BYTE *raw = NULL, *pcm = NULL;
+        DWORD raw_len = 0, pcm_len = 0;
+        WAVEFORMATEX fmt;
+        int cached = 0;
+
+        if (music_cache_acquire(seg->path, &fmt, &pcm, &pcm_len)) {
+            seg->fmt = fmt;
+            seg->pcm = pcm;
+            seg->pcm_bytes = pcm_len;
+            seg->pcm_cached = 1;
+        } else {
+            if (FAILED(load_wav_file_or_pak(seg->path, &raw, &raw_len)) || !raw) {
+                free(raw);
+                return E_FAIL;
+            }
+            if (!decode_to_pcm(raw, raw_len, &fmt, &pcm, &pcm_len, OGG_DECODE_FULL) || !pcm) {
+                free(raw);
+                return E_FAIL;
+            }
+            free(raw);
+            pcm = music_cache_intern_acquire(seg->path, &fmt, pcm, pcm_len, &cached);
+            seg->fmt = fmt;
+            seg->pcm = pcm;
+            seg->pcm_bytes = pcm_len;
+            seg->pcm_cached = cached;
+        }
+    }
+
+    if (music_cache_try_acquire_ds_buf(seg->path, &buf) && buf)
+        return play_pcm_music_start(perf, seg, NULL, flags, pvol, buf, loop_play);
+
+    memset(&desc, 0, sizeof(desc));
+    desc.dwSize = sizeof(desc);
+    desc.dwFlags = DSBCAPS_LOCSOFTWARE | DSBCAPS_CTRLVOLUME | DSBCAPS_GLOBALFOCUS |
+                   DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_STATIC;
+    desc.dwBufferBytes = seg->pcm_bytes;
+    desc.lpwfxFormat = &seg->fmt;
+    hr = IDirectSound_CreateSoundBuffer(perf->ds, &desc, &buf, NULL);
+    if (FAILED(hr) || !buf)
+        return hr;
+    if (!ds_buf_write_all(buf, seg->pcm, seg->pcm_bytes)) {
+        IDirectSoundBuffer_Release(buf);
+        return E_FAIL;
+    }
+    return play_pcm_music_start(perf, seg, NULL, flags, pvol, buf, loop_play);
+}
+
+static DWORD WINAPI music_async_play_proc(void *arg)
+{
+    MusicPlayJob *job = (MusicPlayJob *)arg;
+    HRESULT hr = play_pcm_music_sync(job->perf, job->seg, job->flags, job->pvol);
+    if (SUCCEEDED(hr) && job->state && job->seg->fmt.nAvgBytesPerSec && job->seg->pcm_bytes) {
+        DWORD dur = (DWORD)((ULONGLONG)job->seg->pcm_bytes * 1000ull / job->seg->fmt.nAvgBytesPerSec);
+        notif_schedule_segend(job->perf, job->state, dur);
+    }
+    if (job->state) {
+        InterlockedDecrement(&job->state->refs);
+    }
+    ck_segment_release(job->seg);
+    ck_perf_release(job->perf);
+    {
+        HMODULE module = job->module;
+        free(job);
+        dm_worker_exit(module, 0);
+    }
+    return 0;
+}
+
+static HRESULT music_play_async(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags, LONG pvol)
+{
+    MusicPlayJob *job;
+    HANDLE th;
+    (void)apath;
+
+    job = (MusicPlayJob *)calloc(1, sizeof(*job));
+    if (!job)
+        return E_OUTOFMEMORY;
+    ck_perf_addref(perf);
+    ck_segment_addref(seg);
+    job->perf = perf;
+    job->seg = seg;
+    job->flags = flags;
+    job->pvol = pvol;
+    job->state = NULL;
+    job->module = dm_pin_module((const void *)music_async_play_proc);
+    if (!job->module) {
+        ck_segment_release(seg);
+        ck_perf_release(perf);
+        free(job);
+        return E_OUTOFMEMORY;
+    }
+    th = CreateThread(NULL, 0, music_async_play_proc, job, 0, NULL);
+    if (!th) {
+        FreeLibrary(job->module);
+        ck_segment_release(seg);
+        ck_perf_release(perf);
+        free(job);
+        return play_pcm_music_sync(perf, seg, flags, pvol);
+    }
+    CloseHandle(th);
+    (void)apath;
+    return S_OK;
 }
 
 HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
@@ -1200,28 +1623,56 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
     LONG pvol;
     LONG ppan = 0;
     int use_softpan = 0;
+    int fade_transition = (flags & CK_PLAY_FADE_TRANSITION) != 0;
 
-    if (!perf || !perf->ds || !seg || !seg->pcm || !seg->pcm_bytes)
+    if (!perf || !perf->ds || !seg)
         return E_FAIL;
 
-    if (!apath && seg->last_path)
-        apath = (CkPath *)seg->last_path;
+    if (apath && !InterlockedCompareExchange((LONG *)&apath->active, 0, 0))
+        return S_FALSE;
 
     /* flags=0 → default/music path; flags=0x80 → secondary SFX channel (DIRECTMUSIC.md) */
     is_music = !(flags & 0x80u) && path_is_music(seg->path);
     /* H-M1: do not force-loop all music — only SetRepeats(-1). */
     loop_play = seg->repeats == (DWORD)-1;
-    pvol = apath ? apath->vol : 0;
+    pvol = apath ? InterlockedCompareExchange(&apath->vol, 0, 0) : 0;
+
+    if (is_music) {
+        extern int ck_music_play(const char *, int, LONG);
+        extern int ck_music_is_playing(void);
+        if (ck_music_play(seg->path, loop_play, pvol)) {
+            LPDIRECTSOUNDBUFFER old_buf;
+            CkSegment *old_seg;
+            int fade_transition = (flags & CK_PLAY_FADE_TRANSITION) != 0;
+            EnterCriticalSection(&perf->lock);
+            old_buf = perf->music_buf;
+            old_seg = perf->music_seg;
+            perf->music_buf = NULL;
+            perf->music_seg = seg;
+            ck_segment_addref(seg);
+            perf->music_path_id = apath ? apath->id : 0;
+            LeaveCriticalSection(&perf->lock);
+            music_release_old(old_buf, old_seg, fade_transition, pvol);
+            return S_OK;
+        }
+        return E_FAIL;
+    }
+
+    if (!seg->pcm || !seg->pcm_bytes)
+        return E_FAIL;
+
     if (!is_music && apath && apath->id)
         path_stop_live_sfx(apath->id);
     now = GetTickCount();
     /* H36: Wine GetStatus lies on STATIC buffers → free only by done_tick + margin */
+    live_cs_enter();
     for (i = 0; i < s_live_n;) {
         if ((LONG)(now - s_live[i].done_tick) >= 0) {
             live_free_slot(i);
         } else
             i++;
     }
+    live_cs_leave();
 
     play_bytes = seg->pcm_bytes;
     dur_ms = seg->fmt.nAvgBytesPerSec
@@ -1257,7 +1708,9 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
         WAVEFORMATEX play_wfx = seg->fmt;
         BYTE *render = NULL;
         DWORD render_bytes = play_bytes;
-        ppan = (!is_music && apath) ? apath->pan : 0;
+        ppan = (!is_music && apath)
+                   ? InterlockedCompareExchange(&apath->pan, 0, 0)
+                   : 0;
         use_softpan = !is_music && seg->fmt.wBitsPerSample == 16 &&
                       (seg->fmt.nChannels == 1 || seg->fmt.nChannels == 2);
 
@@ -1288,9 +1741,8 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
             desc.lpwfxFormat = &seg->fmt;
         }
 
-        EnterCriticalSection(&perf->lock);
         hr = IDirectSound_CreateSoundBuffer(perf->ds, &desc, &buf, NULL);
-        if (SUCCEEDED(hr)) {
+        if (SUCCEEDED(hr) && buf) {
             if (render) {
                 if (!ds_buf_write_all(buf, render, render_bytes))
                     hr = E_FAIL;
@@ -1305,33 +1757,23 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
             }
             if (SUCCEEDED(hr)) {
                 DWORD play_flags = loop_play ? DSBPLAY_LOOPING : 0;
+                path_apply_buf_vol(buf, pvol);
+                if (!use_softpan && !is_music && apath)
+                    path_apply_buf_pan(buf, InterlockedCompareExchange(&apath->pan, 0, 0));
                 hr = IDirectSoundBuffer_Play(buf, 0, 0, play_flags);
-                if (SUCCEEDED(hr)) {
-                    path_apply_buf_vol(buf, pvol);
-                    if (!use_softpan && !is_music && apath)
-                        path_apply_buf_pan(buf, apath->pan);
-                }
             }
         }
-        LeaveCriticalSection(&perf->lock);
         free(render);
     }
 
     if (SUCCEEDED(hr) && buf) {
         if (is_music) {
-            if (perf->music_buf) {
-                IDirectSoundBuffer_Stop(perf->music_buf);
-                IDirectSoundBuffer_Release(perf->music_buf);
-            }
-            perf->music_buf = buf;
-            buf = NULL;
-            {
-                DWORD md = seg->fmt.nAvgBytesPerSec
-                               ? (DWORD)((ULONGLONG)seg->pcm_bytes * 1000ull / seg->fmt.nAvgBytesPerSec)
-                               : 1000u;
-                music_note_started(seg->path, loop_play, md, pvol);
-            }
-        } else if (s_live_n < (int)(sizeof(s_live) / sizeof(s_live[0]))) {
+            /* Unreachable — music returns earlier. */
+            IDirectSoundBuffer_Release(buf);
+        } else {
+            live_cs_enter();
+            if (s_live_n >= (int)(sizeof(s_live) / sizeof(s_live[0])))
+                live_free_slot(0);
             memset(&s_live[s_live_n], 0, sizeof(s_live[0]));
             s_live[s_live_n].b = buf;
             s_live[s_live_n].bR = NULL;
@@ -1339,15 +1781,14 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
                 loop_play ? (GetTickCount() + 3600000u) : (GetTickCount() + dur_ms);
             s_live[s_live_n].path_id = apath ? apath->id : 0;
             s_live[s_live_n].seg = seg;
+            ck_segment_addref(seg);
             s_live[s_live_n].spatial = 0;
             s_live[s_live_n].looping = loop_play ? 1 : 0;
             s_live[s_live_n].base_vol = pvol;
             s_live[s_live_n].last_pan = use_softpan ? ppan : 0x7fffffff;
             s_live_n++;
             buf = NULL;
-        } else {
-            IDirectSoundBuffer_Release(buf);
-            buf = NULL;
+            live_cs_leave();
         }
     } else if (buf) {
         IDirectSoundBuffer_Release(buf);

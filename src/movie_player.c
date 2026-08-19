@@ -132,14 +132,14 @@ static int resolve_movie_path(const char *in, char *out, size_t out_sz)
             size_t dir_len = (size_t)(slash - tmp + 1);
             if (dir_len + strlen(webm) + 1 < out_sz) {
                 memcpy(out, tmp, dir_len);
-                strcpy(out + dir_len, webm);
+                memcpy(out + dir_len, webm, strlen(webm) + 1);
                 if (file_exists_a(out))
                     return 1;
             }
             if (dir_len + 5 + strlen(webm) + 1 < out_sz) {
                 memcpy(out, tmp, dir_len);
-                strcpy(out + dir_len, "webm\\");
-                strcat(out, webm);
+                memcpy(out + dir_len, "webm\\", 5);
+                memcpy(out + dir_len + 5, webm, strlen(webm) + 1);
                 if (file_exists_a(out))
                     return 1;
             }

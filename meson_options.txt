@@ -1,0 +1,4 @@
+option('gpu_scene', type : 'boolean', value : false,
+       description : 'Build GPU terrain/decor/obj modules (vk_terrain, vk_decor, vk_obj, etc.)')
+option('logging', type : 'boolean', value : false,
+       description : 'Write debug log to ck_asi.log beside the plugin')
