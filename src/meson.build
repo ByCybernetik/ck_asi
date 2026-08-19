@@ -6,15 +6,19 @@ win_defs_xp  = ['-DWINVER=0x0501', '-D_WIN32_WINNT=0x0501']
 win_defs_7   = ['-DWINVER=0x0601', '-D_WIN32_WINNT=0x0601']
 
 c_warn   = ['-Wno-cast-function-type', '-Wno-unused-function']
+
+# Vulkan headers from third_party (system fallback via -idirafter)
+vk_inc = include_directories('../third_party/Vulkan-Headers/include')
 vk_flags = ['-idirafter', '/usr/include']
 
 if not gpu_scene
   add_project_arguments('-DNO_GPU_SCENE', language : ['c', 'cpp'])
 endif
 
-# --- FreeType (vendored) -------------------------------------------------
+# --- FreeType -------------------------------------------------------------
+# Headers from third_party submodule; prebuilt lib from deps/freetype/lib.
 
-ft_inc = include_directories('../deps/freetype/include')
+ft_inc = include_directories('../third_party/freetype/include')
 ft_lib = cc.find_library('freetype', dirs : [
   meson.project_source_root() / 'deps' / 'freetype' / 'lib',
 ])
@@ -95,7 +99,7 @@ vk_c_args = win_defs_xp + c_warn + vk_flags
 
 lib_vk_present = static_library('vk_present', 'vk_present.c',
   c_args : vk_c_args,
-  include_directories : src_inc,
+  include_directories : [src_inc, vk_inc],
 )
 
 special_libs = [lib_stb_vorbis, lib_tip_font, lib_vk_present]
@@ -103,23 +107,23 @@ special_libs = [lib_stb_vorbis, lib_tip_font, lib_vk_present]
 if gpu_scene
   special_libs += static_library('vk_terrain', 'vk_terrain.c',
     c_args : vk_c_args,
-    include_directories : src_inc,
+    include_directories : [src_inc, vk_inc],
   )
   special_libs += static_library('vk_iso_depth', 'vk_iso_depth.c',
     c_args : vk_c_args,
-    include_directories : src_inc,
+    include_directories : [src_inc, vk_inc],
   )
   special_libs += static_library('vk_decor', 'vk_decor.c',
     c_args : vk_c_args,
-    include_directories : src_inc,
+    include_directories : [src_inc, vk_inc],
   )
   special_libs += static_library('vk_obj', 'vk_obj.c',
     c_args : vk_c_args,
-    include_directories : src_inc,
+    include_directories : [src_inc, vk_inc],
   )
   special_libs += static_library('vk_soft_overlay', 'vk_soft_overlay.c',
     c_args : vk_c_args,
-    include_directories : src_inc,
+    include_directories : [src_inc, vk_inc],
   )
 endif
 

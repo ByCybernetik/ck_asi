@@ -9,6 +9,7 @@ cutscenes, CVM — now as **`CK.asi`**, injected by a thin **`winmm.dll`** loade
 ### Meson (recommended)
 
 ```bash
+git submodule update --init
 meson setup builddir --cross-file cross/i686-w64-mingw32.txt
 meson compile -C builddir
 ```
@@ -23,6 +24,7 @@ meson compile -C builddir
 ### Make (legacy)
 
 ```bash
+git submodule update --init
 make                # CK.asi + winmm.dll
 make GPU_SCENE=0    # without GPU scene modules
 make install        # → ../Imperivm/scripts/CK.asi + ../Imperivm/winmm.dll
@@ -32,13 +34,13 @@ Needs `i686-w64-mingw32-gcc` and the dependencies listed below.
 
 ## Third-party dependencies
 
-| Library | Version | License | Usage | Source |
-|---------|---------|---------|-------|--------|
-| [Vulkan Headers](https://github.com/KhronosGroup/Vulkan-Headers) | 1.0+ | Apache-2.0 / MIT | Swapchain present, GPU terrain/decor/obj rendering | System (`/usr/include/vulkan`) |
-| [FreeType](https://freetype.org/) | 2.x | FTL / GPL-2.0 | Tooltip text rendering (`tip_font.c`) | Vendored in `deps/freetype/` |
-| [stb_vorbis](https://github.com/nothings/stb) | 1.22 | Public domain | Ogg Vorbis audio decoding (DirectMusic replacement) | Bundled: `src/stb_vorbis.c` |
-| [stb_truetype](https://github.com/nothings/stb) | 1.26 | Public domain | TrueType font rasterization (zoom map text) | Bundled: `src/stb_truetype.h` |
-| [MinGW-w64](https://www.mingw-w64.org/) | — | Various (ZPL / public domain) | Cross-compiler toolchain + Win32/COM/DirectSound/DirectShow headers | System package |
+Git submodules in `third_party/` — fetch with `git submodule update --init`.
+
+| Library | Version | License | Usage | Path |
+|---------|---------|---------|-------|------|
+| [Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) | 1.3.302 | Apache-2.0 / MIT | Swapchain present, GPU terrain/decor/obj rendering | `third_party/Vulkan-Headers/` |
+| [FreeType](https://github.com/freetype/freetype) | 2.14.3 | FTL / GPL-2.0 | Tooltip text rendering (`tip_font.c`) | `third_party/freetype/` |
+| [stb](https://github.com/nothings/stb) | latest | Public domain | stb_vorbis 1.22 (Ogg Vorbis), stb_truetype 1.26 (TTF rasterization) | `third_party/stb/` |
 
 ### Win32 SDK libraries (provided by MinGW)
 
@@ -49,8 +51,9 @@ Needs `i686-w64-mingw32-gcc` and the dependencies listed below.
 
 | Dependency | Usage |
 |------------|-------|
-| `menu/native_src` → Imperivm 2 `native/src` | Game UI source (symlink) |
-| `menu/native_tp` → Imperivm 2 `native/third_party` | stb, other TP for menu (symlink) |
+| `src/menu/native_src` → Imperivm 2 `native/src` | Game UI source (symlink) |
+| `src/menu/native_tp` → Imperivm 2 `native/third_party` | stb, other TP for menu (symlink) |
+| `deps/freetype/lib/` | Prebuilt FreeType i686 static lib (not in repo) |
 
 ## Layout
 
@@ -60,8 +63,9 @@ Needs `i686-w64-mingw32-gcc` and the dependencies listed below.
 | `src/loader/` | winmm.dll proxy loader |
 | `src/menu/` | Native menu system (C++) |
 | `src/shaders/` | GLSL shaders + SPIR-V headers |
+| `third_party/` | Git submodules (Vulkan-Headers, FreeType, stb) |
 | `cross/` | Meson cross-compilation files |
-| `deps/freetype/` | Vendored FreeType (include + lib) |
+| `deps/freetype/lib/` | Prebuilt FreeType static lib (external) |
 
 ## Run (Wine)
 

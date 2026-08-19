@@ -12,16 +12,19 @@ CXXFLAGS := -O2 -Wall -Wextra -std=c++17 \
            -DWINVER=0x0601 -D_WIN32_WINNT=0x0601 \
            -fno-exceptions -fno-rtti \
            $(NO_GPU_SCENE_FLAG)
-VK_CFLAGS := -idirafter /usr/include
+VK_CFLAGS := -I$(VK_HDR_DIR) -idirafter /usr/include
 LDFLAGS := -shared -static-libgcc -static-libstdc++ \
            -Wl,--kill-at -Wl,--enable-stdcall-fix \
            -lkernel32 -luser32 -lgdi32 -lole32 -ldsound -lstrmiids -loleaut32 \
            -lwinmm -lws2_32
 LDFLAGS_STATIC_PTHREAD := -Wl,-Bstatic -lstdc++ -lwinpthread -Wl,-Bdynamic
 
-FT_DIR     := deps/freetype
+FT_DIR     := third_party/freetype
 FT_CFLAGS  := -I$(FT_DIR)/include
-FT_LIBS    := -L$(FT_DIR)/lib -lfreetype
+FT_LIBDIR  ?= deps/freetype/lib
+FT_LIBS    := -L$(FT_LIBDIR) -lfreetype
+
+VK_HDR_DIR := third_party/Vulkan-Headers/include
 
 GPU_SCENE ?= 1
 
