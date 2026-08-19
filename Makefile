@@ -178,7 +178,7 @@ install: all
 	cp -f $(ASI) "$(GAME_DIR)/scripts/CK.asi"
 	cp -f $(LOADER) "$(GAME_DIR)/winmm.dll"
 	@echo "installed $(GAME_DIR)/scripts/CK.asi + $(GAME_DIR)/winmm.dll"
-	@echo "  WINEDLLOVERRIDES='winmm=n,b'  CK_DM_REPLACE=1  (loader pulls scripts/CK.asi)"
+	@echo "  WINEDLLOVERRIDES='winmm=n,b'  (loader pulls scripts/CK.asi; dm-replace ON by default)"
 
 install-i2: all
 	mkdir -p "$(GAME_DIR_I2)/scripts"

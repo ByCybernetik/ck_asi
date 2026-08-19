@@ -1,4 +1,5 @@
 #include "dm_replace_internal.h"
+#include "hooks_internal.h"
 
 /*
  * DirectMusic replace entry: CoCreate Loader+Perf stubs, InitAudio → DS,
@@ -7,20 +8,19 @@
 
 void dm_replace_install(void)
 {
+    const char *e = NULL;
     char envbuf[32];
     DWORD nenv = GetEnvironmentVariableA("CK_DM_REPLACE", envbuf, (DWORD)sizeof(envbuf));
-    const char *e = NULL;
+
     /*
-     * Default OFF. Runtime+RE (Celtic_Kings ds8.cpp): our COM stub crashes after the first
-     * Segment::SetRepeats (AV execute @ 0xFFFFFE0C / SEH). Game already ships DX dmusic DLLs;
-     * dm_native redirects CoCreate/LoadLibrary there. Set CK_DM_REPLACE=1 only to test the stub.
-     * Prefer Win32 GetEnvironmentVariableA — Wine often does not expose Unix env to CRT getenv.
+     * Default ON — DirectMusic COM stub + DirectSound playback.
+     * Set CK_DM_REPLACE=0 to use native / game dmusic DLLs via dm_native instead.
      */
+    g_enabled = env_on("CK_DM_REPLACE", 1);
     if (nenv > 0 && nenv < sizeof(envbuf))
         e = envbuf;
     else
         e = getenv("CK_DM_REPLACE");
-    g_enabled = (e && (e[0] == '1') && e[1] == '\0');
     if (!g_live_cs_ok) {
         InitializeCriticalSection(&g_live_cs);
         InterlockedExchange(&g_live_cs_ok, 1);
@@ -36,8 +36,7 @@ void dm_replace_install(void)
     }
     /* #endregion */
     if (!g_enabled) {
-        log_msg("dm-replace: disabled (default) — using dm_native / game dmusic DLLs; "
-                "CK_DM_REPLACE=1 to force stub");
+        log_msg("dm-replace: disabled (CK_DM_REPLACE=0) — using dm_native / game dmusic DLLs");
         return;
     }
     init_vtables();
