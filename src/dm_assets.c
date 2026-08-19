@@ -587,6 +587,7 @@ static int music_preload_one(const char *rel, int *n_ok, int *n_skip, int *n_fai
     WAVEFORMATEX fmt;
     LONGLONG t0;
     double ms;
+    int cached = 0;
     if (music_cache_get(rel, &fmt, &pcm, &pcm_len)) {
         (*n_skip)++;
         return 1;
@@ -602,15 +603,16 @@ static int music_preload_one(const char *rel, int *n_ok, int *n_skip, int *n_fai
         return 0;
     }
     free(raw);
-    pcm = music_cache_intern(rel, &fmt, pcm, pcm_len);
+    pcm = music_cache_intern_acquire(rel, &fmt, pcm, pcm_len, &cached);
     ms = hitch_qpc_ms_since(t0);
-    if (!music_cache_get(rel, &fmt, &pcm, &pcm_len)) {
+    if (!cached) {
         /* Budget rejected — drop unique buffer to avoid leaking preload allocs. */
         free(pcm);
         (*n_fail)++;
         log_msg("dm-replace: music preload drop '%s' (cache budget)", rel);
         return 0;
     }
+    music_cache_release(rel, pcm);
     (*n_ok)++;
     log_msg("dm-replace: music preload '%s' pcm=%lu ms=%.1f", rel, (unsigned long)pcm_len, ms);
     return 1;
@@ -619,25 +621,34 @@ static int music_preload_one(const char *rel, int *n_ok, int *n_skip, int *n_fai
 static DWORD WINAPI music_preload_proc(void *arg)
 {
     int n_ok = 0, n_skip = 0, n_fail = 0;
-    (void)arg;
+    HMODULE module = (HMODULE)arg;
     /* Only warm menu BGM. Full-folder preload (~800MB PCM) OOMs 32-bit and skips tpw*. */
     music_preload_one("music\\_menu.ogg", &n_ok, &n_skip, &n_fail);
     log_msg("dm-replace: music preload done ok=%d skip=%d fail=%d cached=%d bytes=%lu", n_ok, n_skip,
             n_fail, g_music_cache_n, (unsigned long)g_music_cache_bytes);
+    dm_worker_exit(module, 0);
     return 0;
 }
 
 void music_preload_start(void)
 {
     HANDLE th;
+    HMODULE module;
     if (InterlockedCompareExchange(&g_music_preload_started, 1, 0) != 0)
         return;
     music_cache_ensure_cs();
-    th = CreateThread(NULL, 0, music_preload_proc, NULL, 0, NULL);
+    module = dm_pin_module((const void *)music_preload_proc);
+    if (!module) {
+        InterlockedExchange(&g_music_preload_started, 0);
+        return;
+    }
+    th = CreateThread(NULL, 0, music_preload_proc, module, 0, NULL);
     if (th)
         CloseHandle(th);
-    else
+    else {
+        FreeLibrary(module);
         InterlockedExchange(&g_music_preload_started, 0);
+    }
 }
 
 static char g_game_dir[MAX_PATH];

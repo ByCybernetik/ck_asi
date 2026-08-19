@@ -371,20 +371,29 @@ void dm_replace_beacon_tick(void)
 
 static DWORD WINAPI beacon_timer_proc(void *arg)
 {
-    (void)arg;
+    HMODULE module = (HMODULE)arg;
     while (InterlockedCompareExchange(&g_beacon_timer_run, 1, 1) == 1) {
         dm_replace_beacon_tick();
         Sleep(16);
     }
+    dm_worker_exit(module, 0);
     return 0;
 }
 
 static void beacon_timer_start(void)
 {
+    HMODULE module;
     if (g_beacon_timer)
         return;
+    module = dm_pin_module((const void *)beacon_timer_proc);
+    if (!module)
+        return;
     InterlockedExchange(&g_beacon_timer_run, 1);
-    g_beacon_timer = CreateThread(NULL, 0, beacon_timer_proc, NULL, 0, NULL);
+    g_beacon_timer = CreateThread(NULL, 0, beacon_timer_proc, module, 0, NULL);
+    if (!g_beacon_timer) {
+        InterlockedExchange(&g_beacon_timer_run, 0);
+        FreeLibrary(module);
+    }
 }
 
 static LPDIRECTSOUNDBUFFER beacon_make_half(LPDIRECTSOUND ds, const WAVEFORMATEX *wfx, BYTE *pcm,
@@ -449,7 +458,7 @@ void beacon_start_from_seg(CkPerf *perf, CkSegment *seg, CkPath *apath)
         return;
     }
 
-    base_vol = apath ? apath->vol : 0;
+    base_vol = apath ? InterlockedCompareExchange(&apath->vol, 0, 0) : 0;
     g_beacon_L = beacon_make_half(perf->ds, &wfx, left, stereo_bytes, base_vol, 1);
     g_beacon_R = beacon_make_half(perf->ds, &wfx, right, stereo_bytes, base_vol, 1);
     free(left);
@@ -460,7 +469,8 @@ void beacon_start_from_seg(CkPerf *perf, CkSegment *seg, CkPath *apath)
     }
 
     g_beacon_path_id = apath ? apath->id : 0;
-    g_beacon_last_game_pan = apath ? apath->pan : 0;
+    g_beacon_last_game_pan =
+        apath ? InterlockedCompareExchange(&apath->pan, 0, 0) : 0;
     g_beacon_last_applied = 0x7fffffff;
     g_beacon_last_yatten = 0x7fffffff;
     g_beacon_tick_n = 0;
@@ -640,7 +650,7 @@ int spatial_voice_play(CkPerf *perf, CkSegment *seg, CkPath *apath, int loop)
         return 0;
     }
 
-    base_vol = apath ? apath->vol : 0;
+    base_vol = apath ? InterlockedCompareExchange(&apath->vol, 0, 0) : 0;
     bL = beacon_make_half(perf->ds, &wfx, left, stereo_bytes, base_vol, loop);
     bR = beacon_make_half(perf->ds, &wfx, right, stereo_bytes, base_vol, loop);
     free(left);
@@ -829,7 +839,7 @@ void path_propagate_volume(CkPath *path)
 
     if (!path)
         return;
-    vol = path_clamp_vol(path->vol);
+    vol = path_clamp_vol(InterlockedCompareExchange(&path->vol, 0, 0));
     if (path->ctrl)
         IDirectSoundBuffer_SetVolume(path->ctrl, vol);
     {
@@ -924,7 +934,7 @@ void path_propagate_pan(CkPath *path)
 
     if (!path)
         return;
-    pan = path_clamp_pan(path->pan);
+    pan = path_clamp_pan(InterlockedCompareExchange(&path->pan, 0, 0));
     if (path->ctrl)
         IDirectSoundBuffer_SetPan(path->ctrl, pan);
     live_cs_enter();
@@ -1292,6 +1302,7 @@ typedef struct {
     LPDIRECTSOUNDBUFFER buf;
     CkSegment *seg;
     LONG start_vol;
+    HMODULE module;
 } CkMusicFade;
 
 static DWORD WINAPI music_fade_release_proc(void *arg)
@@ -1307,7 +1318,11 @@ static DWORD WINAPI music_fade_release_proc(void *arg)
     IDirectSoundBuffer_Release(fade->buf);
     if (fade->seg)
         ck_segment_release(fade->seg);
-    free(fade);
+    {
+        HMODULE module = fade->module;
+        free(fade);
+        dm_worker_exit(module, 0);
+    }
     return 0;
 }
 
@@ -1338,6 +1353,15 @@ static void music_release_old(LPDIRECTSOUNDBUFFER buf, CkSegment *seg, int fade,
     ctx->buf = buf;
     ctx->seg = seg;
     ctx->start_vol = path_clamp_vol(start_vol);
+    ctx->module = dm_pin_module((const void *)music_fade_release_proc);
+    if (!ctx->module) {
+        IDirectSoundBuffer_Stop(buf);
+        IDirectSoundBuffer_Release(buf);
+        if (seg)
+            ck_segment_release(seg);
+        free(ctx);
+        return;
+    }
     thread = CreateThread(NULL, 0, music_fade_release_proc, ctx, 0, NULL);
     if (thread) {
         CloseHandle(thread);
@@ -1347,6 +1371,7 @@ static void music_release_old(LPDIRECTSOUNDBUFFER buf, CkSegment *seg, int fade,
     IDirectSoundBuffer_Release(buf);
     if (seg)
         ck_segment_release(seg);
+    FreeLibrary(ctx->module);
     free(ctx);
 }
 
@@ -1371,16 +1396,14 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
     if (!perf || !perf->ds || !seg || !seg->pcm || !seg->pcm_bytes)
         return E_FAIL;
 
-    if (!apath && seg->last_path)
-        apath = (CkPath *)seg->last_path;
-    if (apath && !apath->active)
+    if (apath && !InterlockedCompareExchange((LONG *)&apath->active, 0, 0))
         return S_FALSE;
 
     /* flags=0 → default/music path; flags=0x80 → secondary SFX channel (DIRECTMUSIC.md) */
     is_music = !(flags & 0x80u) && path_is_music(seg->path);
     /* H-M1: do not force-loop all music — only SetRepeats(-1). */
     loop_play = seg->repeats == (DWORD)-1;
-    pvol = apath ? apath->vol : 0;
+    pvol = apath ? InterlockedCompareExchange(&apath->vol, 0, 0) : 0;
     if (!is_music && apath && apath->id)
         path_stop_live_sfx(apath->id);
     now = GetTickCount();
@@ -1428,7 +1451,9 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
         WAVEFORMATEX play_wfx = seg->fmt;
         BYTE *render = NULL;
         DWORD render_bytes = play_bytes;
-        ppan = (!is_music && apath) ? apath->pan : 0;
+        ppan = (!is_music && apath)
+                   ? InterlockedCompareExchange(&apath->pan, 0, 0)
+                   : 0;
         use_softpan = !is_music && seg->fmt.wBitsPerSample == 16 &&
                       (seg->fmt.nChannels == 1 || seg->fmt.nChannels == 2);
 
@@ -1480,7 +1505,8 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
                 if (SUCCEEDED(hr)) {
                     path_apply_buf_vol(buf, pvol);
                     if (!use_softpan && !is_music && apath)
-                        path_apply_buf_pan(buf, apath->pan);
+                        path_apply_buf_pan(
+                            buf, InterlockedCompareExchange(&apath->pan, 0, 0));
                 }
             }
         }

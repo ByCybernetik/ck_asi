@@ -500,6 +500,7 @@ static ULONG STDMETHODCALLTYPE path_Release(CkPath *This)
 {
     LONG r = InterlockedDecrement(&This->refs);
     if (r == 0) {
+        live_cs_enter();
         if (This->ctrl_proxy) {
             CkDsCtrl *px = (CkDsCtrl *)This->ctrl_proxy;
             This->ctrl_proxy = NULL;
@@ -511,6 +512,7 @@ static ULONG STDMETHODCALLTYPE path_Release(CkPath *This)
             IDirectSoundBuffer_Release(This->ctrl);
             This->ctrl = NULL;
         }
+        live_cs_leave();
         free(This);
     }
     return (ULONG)r;
@@ -535,6 +537,7 @@ typedef struct {
     LONG to;
     LONG generation;
     DWORD duration_ms;
+    HMODULE module;
 } CkVolumeRamp;
 
 static DWORD WINAPI path_volume_ramp_proc(void *arg)
@@ -543,21 +546,28 @@ static DWORD WINAPI path_volume_ramp_proc(void *arg)
     DWORD start = GetTickCount();
     for (;;) {
         DWORD elapsed = GetTickCount() - start;
-        if (ramp->path->volume_generation != ramp->generation)
+        LONG value;
+        if (InterlockedCompareExchange(&ramp->path->volume_generation, 0, 0) !=
+            ramp->generation)
             break;
         if (elapsed >= ramp->duration_ms) {
-            ramp->path->vol = ramp->to;
+            InterlockedExchange(&ramp->path->vol, ramp->to);
             path_propagate_volume(ramp->path);
             break;
         }
-        ramp->path->vol =
-            ramp->from + (LONG)(((LONGLONG)(ramp->to - ramp->from) * elapsed) /
-                                ramp->duration_ms);
+        value = ramp->from +
+                (LONG)(((LONGLONG)(ramp->to - ramp->from) * elapsed) /
+                       ramp->duration_ms);
+        InterlockedExchange(&ramp->path->vol, value);
         path_propagate_volume(ramp->path);
         Sleep(16);
     }
     path_Release(ramp->path);
-    free(ramp);
+    {
+        HMODULE module = ramp->module;
+        free(ramp);
+        dm_worker_exit(module, 0);
+    }
     return 0;
 }
 
@@ -567,27 +577,35 @@ static HRESULT STDMETHODCALLTYPE path_SetVolume(CkPath *This, LONG vol, DWORD du
     CkVolumeRamp *ramp;
     HANDLE thread;
     LONG from;
+    LONG generation;
     if (!This)
         return E_POINTER;
     vol = path_clamp_vol(vol);
-    from = This->vol;
-    InterlockedIncrement(&This->volume_generation);
+    from = InterlockedCompareExchange(&This->vol, 0, 0);
+    generation = InterlockedIncrement(&This->volume_generation);
     if (!dur || from == vol) {
-        This->vol = vol;
+        InterlockedExchange(&This->vol, vol);
         path_propagate_volume(This);
         return S_OK;
     }
     ramp = (CkVolumeRamp *)calloc(1, sizeof(*ramp));
     if (!ramp) {
-        This->vol = vol;
+        InterlockedExchange(&This->vol, vol);
         path_propagate_volume(This);
         return E_OUTOFMEMORY;
     }
     ramp->path = This;
     ramp->from = from;
     ramp->to = vol;
-    ramp->generation = This->volume_generation;
+    ramp->generation = generation;
     ramp->duration_ms = dur > 60000u ? 60000u : dur;
+    ramp->module = dm_pin_module((const void *)path_volume_ramp_proc);
+    if (!ramp->module) {
+        free(ramp);
+        InterlockedExchange(&This->vol, vol);
+        path_propagate_volume(This);
+        return E_FAIL;
+    }
     path_AddRef(This);
     thread = CreateThread(NULL, 0, path_volume_ramp_proc, ramp, 0, NULL);
     if (thread) {
@@ -595,8 +613,9 @@ static HRESULT STDMETHODCALLTYPE path_SetVolume(CkPath *This, LONG vol, DWORD du
         return S_OK;
     }
     path_Release(This);
+    FreeLibrary(ramp->module);
     free(ramp);
-    This->vol = vol;
+    InterlockedExchange(&This->vol, vol);
     path_propagate_volume(This);
     return HRESULT_FROM_WIN32(GetLastError());
 }
@@ -604,8 +623,8 @@ static HRESULT STDMETHODCALLTYPE path_Activate(CkPath *This, BOOL on)
 {
     if (!This)
         return E_POINTER;
-    This->active = on ? 1 : 0;
-    if (!This->active)
+    InterlockedExchange((LONG *)&This->active, on ? 1 : 0);
+    if (!on)
         path_stop_live_sfx(This->id);
     return S_OK;
 }
@@ -654,33 +673,60 @@ static ULONG STDMETHODCALLTYPE dsc_Release(CkDsCtrl *This)
 }
 static HRESULT STDMETHODCALLTYPE dsc_GetVolume(CkDsCtrl *This, LONG *vol)
 {
+    CkPath *path;
     if (!This || !vol)
         return E_POINTER;
-    *vol = This->path ? This->path->vol : 0;
+    live_cs_enter();
+    path = This->path;
+    *vol = path ? InterlockedCompareExchange(&path->vol, 0, 0) : 0;
+    live_cs_leave();
     return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE dsc_GetPan(CkDsCtrl *This, LONG *pan)
 {
+    CkPath *path;
     if (!This || !pan)
         return E_POINTER;
-    *pan = This->path ? This->path->pan : 0;
+    live_cs_enter();
+    path = This->path;
+    *pan = path ? InterlockedCompareExchange(&path->pan, 0, 0) : 0;
+    live_cs_leave();
     return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE dsc_SetVolume(CkDsCtrl *This, LONG vol)
 {
-    if (!This || !This->path)
+    CkPath *path;
+    if (!This)
         return E_POINTER;
-    This->path->vol = vol;
-    path_propagate_volume(This->path);
+    live_cs_enter();
+    path = This->path;
+    if (!path) {
+        live_cs_leave();
+        return E_FAIL;
+    }
+    InterlockedIncrement(&path->volume_generation);
+    InterlockedExchange(&path->vol, path_clamp_vol(vol));
+    path_propagate_volume(path);
+    live_cs_leave();
     return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE dsc_SetPan(CkDsCtrl *This, LONG pan)
 {
-    if (!This || !This->path)
+    CkPath *path;
+    LONG clamped;
+    if (!This)
         return E_POINTER;
-    This->path->pan = path_clamp_pan(pan);
-    path_propagate_pan(This->path);
-    beacon_update_pan(This->path->pan, This->path->id);
+    live_cs_enter();
+    path = This->path;
+    if (!path) {
+        live_cs_leave();
+        return E_FAIL;
+    }
+    clamped = path_clamp_pan(pan);
+    InterlockedExchange(&path->pan, clamped);
+    path_propagate_pan(path);
+    beacon_update_pan(clamped, path->id);
+    live_cs_leave();
     return S_OK;
 }
 
@@ -705,7 +751,6 @@ static void init_dsctrl_vt(void)
 static CkDsCtrl *path_ensure_ctrl_proxy(CkPath *path)
 {
     CkDsCtrl *px;
-    CkPerf *perf;
     if (!path)
         return NULL;
     if (path->ctrl_proxy)
@@ -727,6 +772,7 @@ static HRESULT STDMETHODCALLTYPE path_GetObjectInPath(CkPath *This, DWORD pch, D
                                                        void **ppObject)
 {
     CkDsCtrl *px;
+    CkPerf *perf;
     (void)pch;
     (void)buf;
     (void)guidObj;
@@ -779,10 +825,14 @@ static HRESULT STDMETHODCALLTYPE path_GetObjectInPath(CkPath *This, DWORD pch, D
                 memcpy(p1, silence, n1);
             IDirectSoundBuffer_Unlock(This->ctrl, p1, n1, p2, n2);
         }
-        if (This->vol)
-            IDirectSoundBuffer_SetVolume(This->ctrl, This->vol);
-        if (This->pan)
-            IDirectSoundBuffer_SetPan(This->ctrl, This->pan);
+        {
+            LONG vol = InterlockedCompareExchange(&This->vol, 0, 0);
+            LONG pan = InterlockedCompareExchange(&This->pan, 0, 0);
+            if (vol)
+                IDirectSoundBuffer_SetVolume(This->ctrl, vol);
+            if (pan)
+                IDirectSoundBuffer_SetPan(This->ctrl, pan);
+        }
     }
 
     px = path_ensure_ctrl_proxy(This);
@@ -878,6 +928,25 @@ static HRESULT STDMETHODCALLTYPE state_GetSegment(CkState *This, void **segment)
 /* -------- segment -------- */
 static CkSegment *g_segments;
 
+static void segment_set_path(CkSegment *seg, CkPath *path)
+{
+    CkPath *old;
+    if (!seg)
+        return;
+    live_cs_enter();
+    if (seg->last_path == path) {
+        live_cs_leave();
+        return;
+    }
+    if (path)
+        path_AddRef(path);
+    old = (CkPath *)seg->last_path;
+    seg->last_path = path;
+    live_cs_leave();
+    if (old)
+        path_Release(old);
+}
+
 static void segment_register(CkSegment *seg)
 {
     live_cs_enter();
@@ -886,10 +955,16 @@ static void segment_register(CkSegment *seg)
     live_cs_leave();
 }
 
-static void segment_unregister(CkSegment *seg)
+static void segment_destroy(CkSegment *seg)
 {
     CkSegment **link;
+    if (!seg)
+        return;
     live_cs_enter();
+    if (InterlockedCompareExchange(&seg->destroying, 1, 0) != 0) {
+        live_cs_leave();
+        return;
+    }
     for (link = &g_segments; *link; link = &(*link)->registry_next) {
         if (*link == seg) {
             *link = seg->registry_next;
@@ -898,17 +973,11 @@ static void segment_unregister(CkSegment *seg)
     }
     seg->registry_next = NULL;
     live_cs_leave();
-}
-
-static void segment_destroy(CkSegment *seg)
-{
-    if (!seg)
-        return;
-    segment_unregister(seg);
     if (seg->pcm_cached)
         music_cache_release(seg->path, seg->pcm);
     else
         free(seg->pcm);
+    segment_set_path(seg, NULL);
     seg->pcm = NULL;
     free(seg);
 }
@@ -920,7 +989,8 @@ static void segments_collect_retired(int force)
     seg = g_segments;
     while (seg) {
         next = seg->registry_next;
-        if (seg->refs <= 0 && (force || seg->unloaded))
+        if (InterlockedCompareExchange(&seg->refs, 0, 0) <= 0 &&
+            (force || InterlockedCompareExchange((LONG *)&seg->unloaded, 0, 0)))
             segment_destroy(seg);
         seg = next;
     }
@@ -935,9 +1005,14 @@ void dm_com_collect_all(void)
 
 ULONG ck_segment_addref(CkSegment *seg)
 {
+    ULONG refs = 0;
     if (!seg)
         return 0;
-    return (ULONG)InterlockedIncrement(&seg->refs);
+    live_cs_enter();
+    if (!seg->destroying)
+        refs = (ULONG)InterlockedIncrement(&seg->refs);
+    live_cs_leave();
+    return refs;
 }
 
 ULONG ck_segment_release(CkSegment *seg)
@@ -945,6 +1020,11 @@ ULONG ck_segment_release(CkSegment *seg)
     LONG r;
     if (!seg)
         return 0;
+    live_cs_enter();
+    if (seg->destroying) {
+        live_cs_leave();
+        return 0;
+    }
     r = InterlockedDecrement(&seg->refs);
     /* #region agent log */
     {
@@ -955,8 +1035,9 @@ ULONG ck_segment_release(CkSegment *seg)
     }
     /* #endregion */
     /* Game may touch a released segment until Unload; defer destruction until then. */
-    if (r <= 0 && seg->unloaded)
+    if (r <= 0 && InterlockedCompareExchange((LONG *)&seg->unloaded, 0, 0))
         segment_destroy(seg);
+    live_cs_leave();
     return (ULONG)r;
 }
 
@@ -1077,7 +1158,7 @@ static HRESULT STDMETHODCALLTYPE seg_GetRepeats(CkSegment *This, DWORD a, DWORD 
 static HRESULT STDMETHODCALLTYPE seg_Download(CkSegment *This, void *pAudioPath)
 {
     ck_ring_push(3, 29);
-    This->last_path = pAudioPath;
+    segment_set_path(This, (CkPath *)pAudioPath);
     /* #region agent log */
     {
         char js[160];
@@ -1102,9 +1183,11 @@ static HRESULT STDMETHODCALLTYPE seg_Unload(CkSegment *This, void *pAudioPath)
         /* Only stop BGM — do not wipe s_live (playlist track change Unloads music). */
         stop_music_buf();
     }
-    This->unloaded = 1;
-    if (This->refs <= 0)
+    live_cs_enter();
+    InterlockedExchange((LONG *)&This->unloaded, 1);
+    if (InterlockedCompareExchange(&This->refs, 0, 0) <= 0)
         segment_destroy(This);
+    live_cs_leave();
     return S_OK;
 }
 
@@ -1202,6 +1285,8 @@ static HRESULT STDMETHODCALLTYPE perf_InitAudio(CkPerf *This, void **ppDM, void 
 
     if (ppDM)
         *ppDM = NULL;
+    if (ppDS)
+        *ppDS = NULL;
     (void)pathType;
     (void)pchannels;
     (void)params;
@@ -1230,14 +1315,16 @@ static HRESULT STDMETHODCALLTYPE perf_InitAudio(CkPerf *This, void **ppDM, void 
     desc.dwSize = sizeof(desc);
     desc.dwFlags = DSBCAPS_PRIMARYBUFFER;
     hr = IDirectSound_CreateSoundBuffer(This->ds, &desc, &This->primary, NULL);
-    if (SUCCEEDED(hr))
-        IDirectSoundBuffer_SetFormat(This->primary, &wfx);
+    if (FAILED(hr)) {
+        IDirectSound_Release(This->ds);
+        This->ds = NULL;
+        return hr;
+    }
+    IDirectSoundBuffer_SetFormat(This->primary, &wfx);
 
-    if (ppDS)
-    {
+    if (SUCCEEDED(hr) && ppDS) {
         *ppDS = This->ds;
-        if (This->ds)
-            IDirectSound_AddRef(This->ds);
+        IDirectSound_AddRef(This->ds);
     }
 
     live_cs_enter();
@@ -1313,6 +1400,7 @@ static HRESULT STDMETHODCALLTYPE perf_PlaySegmentEx(CkPerf *This, void *source, 
     CkState *st = NULL;
     char js[280];
     CkPath *path = (CkPath *)(audiopath ? audiopath : from);
+    int path_borrowed = 0;
 
     (void)name;
     (void)start;
@@ -1322,9 +1410,16 @@ static HRESULT STDMETHODCALLTYPE perf_PlaySegmentEx(CkPerf *This, void *source, 
     if (!seg || !seg->pcm)
         return E_INVALIDARG;
     if (!seg->last_path && path)
-        seg->last_path = path;
-    if (!path && seg->last_path)
+        segment_set_path(seg, path);
+    if (!path) {
+        live_cs_enter();
         path = (CkPath *)seg->last_path;
+        if (path) {
+            path_AddRef(path);
+            path_borrowed = 1;
+        }
+        live_cs_leave();
+    }
 
     /* #region agent log */
     {
@@ -1333,7 +1428,8 @@ static HRESULT STDMETHODCALLTYPE perf_PlaySegmentEx(CkPerf *This, void *source, 
                  "{\"n\":%ld,\"pcm\":%lu,\"flags\":0x%lX,\"refs\":%ld,\"path_id\":%lu,\"vol\":%ld,"
                  "\"repeats\":%ld,\"path\":\"%.80s\"}",
                  (long)n, (unsigned long)seg->pcm_bytes, (unsigned long)flags, (long)seg->refs,
-                 (unsigned long)(path ? path->id : 0), (long)(path ? path->vol : 0),
+                 (unsigned long)(path ? path->id : 0),
+                 (long)(path ? InterlockedCompareExchange(&path->vol, 0, 0) : 0),
                  (long)(LONG)seg->repeats, seg->path);
         dm_agent("H40", "dm_replace.c:PlaySegmentEx", "play-enter", js0);
     }
@@ -1377,7 +1473,8 @@ static HRESULT STDMETHODCALLTYPE perf_PlaySegmentEx(CkPerf *This, void *source, 
                  "{\"n\":%ld,\"hr\":%ld,\"flags\":0x%lX,\"pcm\":%lu,\"path_id\":%lu,\"vol\":%ld,"
                  "\"ambient\":%d,\"file\":\"%.48s\",\"tid\":%lu}",
                  (long)n, (long)hr, (unsigned long)flags, (unsigned long)seg->pcm_bytes,
-                 (unsigned long)(path ? path->id : 0), (long)(path ? path->vol : 0), amb, base,
+                 (unsigned long)(path ? path->id : 0),
+                 (long)(path ? InterlockedCompareExchange(&path->vol, 0, 0) : 0), amb, base,
                  (unsigned long)GetCurrentThreadId());
         dm_agent(amb ? "H-AMB" : "H40", "dm_replace.c:PlaySegmentEx",
                  amb ? "ambient-play" : "play-seg", js);
@@ -1386,6 +1483,8 @@ static HRESULT STDMETHODCALLTYPE perf_PlaySegmentEx(CkPerf *This, void *source, 
     if (n <= 40 || (n % 25) == 0)
         log_msg("dm-replace: PlaySegmentEx #%ld hr=0x%08lx pcm=%lu", (long)n, (unsigned long)hr,
                 (unsigned long)seg->pcm_bytes);
+    if (path_borrowed)
+        path_Release(path);
     return hr;
 }
 

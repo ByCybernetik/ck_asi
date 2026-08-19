@@ -97,6 +97,7 @@ typedef struct CkSegmentTag {
     DWORD repeats;
     int pcm_cached;
     int unloaded;
+    LONG destroying;
     struct CkSegmentTag *registry_next;
     char path[260];
 } CkSegment;
@@ -224,6 +225,8 @@ void dm_agent(const char *hid, const char *loc, const char *msg, const char *dat
 void ck_ring_push(int kind, int slot);
 void ck_ring_dump(const char *why);
 LONG CALLBACK ck_veh(struct _EXCEPTION_POINTERS *ep);
+HMODULE dm_pin_module(const void *address);
+void dm_worker_exit(HMODULE module, DWORD code);
 
 /* ---- pcm / path classifiers ---- */
 LONG path_clamp_vol(LONG vol);

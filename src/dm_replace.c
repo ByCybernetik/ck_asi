@@ -49,6 +49,23 @@ int dm_replace_enabled(void)
     return g_enabled;
 }
 
+HMODULE dm_pin_module(const void *address)
+{
+    HMODULE module = NULL;
+    if (!address ||
+        !GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                            (LPCSTR)address, &module))
+        return NULL;
+    return module;
+}
+
+void dm_worker_exit(HMODULE module, DWORD code)
+{
+    if (module)
+        FreeLibraryAndExitThread(module, code);
+    ExitThread(code);
+}
+
 void dm_replace_shutdown(void)
 {
     if (!g_enabled)

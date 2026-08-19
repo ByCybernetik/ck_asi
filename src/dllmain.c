@@ -25,7 +25,6 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
     case DLL_PROCESS_DETACH:
 
         hooks_remove();
-        dm_replace_shutdown();
         dm_native_remove();
         hitch_shutdown();
         log_shutdown();
