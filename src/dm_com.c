@@ -3,16 +3,19 @@
 
 static ULONG STDMETHODCALLTYPE state_Release(CkState *This);
 
+static volatile LONG g_music_ended;
+
 static void ckm_on_music_end(void *ctx)
 {
-    CkPerf *perf;
-    CkState *st;
     (void)ctx;
-    live_cs_enter();
-    perf = g_active_perf;
-    if (perf)
-        ck_perf_addref(perf);
-    live_cs_leave();
+    InterlockedExchange(&g_music_ended, 1);
+}
+
+static void ckm_check_music_end(CkPerf *perf)
+{
+    CkState *st;
+    if (!InterlockedCompareExchange(&g_music_ended, 0, 1))
+        return;
     if (!perf)
         return;
     EnterCriticalSection(&perf->lock);
@@ -23,7 +26,6 @@ static void ckm_on_music_end(void *ctx)
         notif_schedule_segend(perf, st, 50);
         InterlockedDecrement(&st->refs);
     }
-    ck_perf_release(perf);
 }
 
 static void notif_clear_all(CkPerf *perf)
@@ -117,6 +119,7 @@ void notif_tick(CkPerf *perf)
     HANDLE event;
     if (!perf)
         return;
+    ckm_check_music_end(perf);
     now = GetTickCount();
     EnterCriticalSection(&perf->lock);
     event = perf->notif_event;
