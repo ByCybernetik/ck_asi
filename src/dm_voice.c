@@ -1527,6 +1527,36 @@ static HRESULT play_pcm_music_sync(CkPerf *perf, CkSegment *seg, DWORD flags, LO
     HRESULT hr;
     int loop_play = seg->repeats == (DWORD)-1;
 
+    /* If segment has no PCM yet, load and decode now (on worker thread). */
+    if (!seg->pcm || !seg->pcm_bytes) {
+        BYTE *raw = NULL, *pcm = NULL;
+        DWORD raw_len = 0, pcm_len = 0;
+        WAVEFORMATEX fmt;
+        int cached = 0;
+
+        if (music_cache_acquire(seg->path, &fmt, &pcm, &pcm_len)) {
+            seg->fmt = fmt;
+            seg->pcm = pcm;
+            seg->pcm_bytes = pcm_len;
+            seg->pcm_cached = 1;
+        } else {
+            if (FAILED(load_wav_file_or_pak(seg->path, &raw, &raw_len)) || !raw) {
+                free(raw);
+                return E_FAIL;
+            }
+            if (!decode_to_pcm(raw, raw_len, &fmt, &pcm, &pcm_len, OGG_DECODE_FULL) || !pcm) {
+                free(raw);
+                return E_FAIL;
+            }
+            free(raw);
+            pcm = music_cache_intern_acquire(seg->path, &fmt, pcm, pcm_len, &cached);
+            seg->fmt = fmt;
+            seg->pcm = pcm;
+            seg->pcm_bytes = pcm_len;
+            seg->pcm_cached = cached;
+        }
+    }
+
     if (music_cache_try_acquire_ds_buf(seg->path, &buf) && buf)
         return play_pcm_music_start(perf, seg, NULL, flags, pvol, buf, loop_play);
 
@@ -1632,13 +1662,7 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
             perf->music_wasapi = 0;
             log_msg("dm-replace: WASAPI play failed, falling back to DirectSound");
         }
-        {
-        LPDIRECTSOUNDBUFFER cached = NULL;
-        music_cache_build_ds_for_path(perf->ds, seg->path);
-        if (music_cache_try_acquire_ds_buf(seg->path, &cached) && cached)
-            return play_pcm_music_start(perf, seg, apath, flags, pvol, cached, loop_play);
         return music_play_async(perf, seg, apath, flags, pvol);
-        }
     }
 
     if (!seg->pcm || !seg->pcm_bytes)

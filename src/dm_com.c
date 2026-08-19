@@ -1453,9 +1453,9 @@ static HRESULT STDMETHODCALLTYPE perf_PlaySegmentEx(CkPerf *This, void *source, 
         int loop = seg->repeats == (DWORD)-1;
         /* Non-loop music needs SEGEND so the game can advance the playlist. */
         if (!music || !loop) {
-            DWORD dur = seg->fmt.nAvgBytesPerSec
+            DWORD dur = seg->fmt.nAvgBytesPerSec && seg->pcm_bytes
                             ? (DWORD)((ULONGLONG)seg->pcm_bytes * 1000ull / seg->fmt.nAvgBytesPerSec)
-                            : 1000u;
+                            : 180000u;
             notif_schedule_segend(This, st, dur);
         }
     }
@@ -1662,10 +1662,30 @@ static HRESULT STDMETHODCALLTYPE ldr_GetObject(CkLoader *This, void *pDesc, REFI
         return E_FAIL;
     }
 
-    /* Music: shared full-PCM cache (H-AUD). SFX: small copy cache. */
-    if (path_is_music(scraped) && music_cache_acquire(scraped, &fmt, &pcm_buf, &pcm_len)) {
-        pcm_cached = 1;
-    } else if (!path_is_music(scraped) && cache_get(scraped, &fmt, &pcm_buf, &pcm_len)) {
+    /* Music: skip sync decode — play_pcm will handle it async. */
+    if (path_is_music(scraped)) {
+        seg = (CkSegment *)calloc(1, sizeof(*seg));
+        if (!seg)
+            return E_OUTOFMEMORY;
+        seg->lpVtbl = g_seg_vt;
+        seg->refs = 1;
+        memset(&seg->fmt, 0, sizeof(seg->fmt));
+        seg->fmt.wFormatTag = WAVE_FORMAT_PCM;
+        seg->fmt.nChannels = 2;
+        seg->fmt.nSamplesPerSec = 44100;
+        seg->fmt.wBitsPerSample = 16;
+        seg->fmt.nBlockAlign = 4;
+        seg->fmt.nAvgBytesPerSec = 44100 * 4;
+        seg->pcm = NULL;
+        seg->pcm_bytes = 0;
+        strncpy(seg->path, scraped, sizeof(seg->path) - 1);
+        segment_register(seg);
+        *ppv = seg;
+        return S_OK;
+    }
+
+    /* SFX: small copy cache. */
+    if (cache_get(scraped, &fmt, &pcm_buf, &pcm_len)) {
         /* ok — SFX owned copy */
     } else {
         LONGLONG t_dec;
