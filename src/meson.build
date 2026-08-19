@@ -3,7 +3,6 @@ cc = meson.get_compiler('c')
 # --- Common flags --------------------------------------------------------
 
 win_defs_xp  = ['-DWINVER=0x0501', '-D_WIN32_WINNT=0x0501']
-win_defs_7   = ['-DWINVER=0x0601', '-D_WIN32_WINNT=0x0601']
 
 c_warn   = ['-Wno-cast-function-type', '-Wno-unused-function']
 
@@ -23,14 +22,6 @@ ft_dep = dependency('freetype2', fallback : ['freetype2', 'freetype_dep'])
 # --- Include directories -------------------------------------------------
 
 src_inc = include_directories('.')
-
-menu_inc = include_directories(
-  'menu',
-  'menu/iconv_compat',
-  'menu/native_src',
-  'menu/native_tp',
-  'menu/native_tp/stb',
-)
 
 # --- ASI: normal C sources (default c_args) ------------------------------
 
@@ -125,46 +116,12 @@ if gpu_scene
   )
 endif
 
-# --- Menu (C++) ----------------------------------------------------------
+# --- Native menu stub (no external menu/native_src dependency) -----------
 
-menu_force_inc = meson.current_source_dir() / 'menu' / 'ck_sdl_stub.h'
-menu_cpp_args = win_defs_7 + ['-include', menu_force_inc]
-
-special_libs += static_library('ck_menu_host', 'menu/ck_menu_host.cpp',
-  cpp_args : menu_cpp_args,
-  include_directories : [src_inc, menu_inc],
-)
-
-menu_native_sources = {
-  'nm_main_menu'     : 'menu/native_src/ui/main_menu.cpp',
-  'nm_blit'          : 'menu/native_src/ui/blit.cpp',
-  'nm_font_stb'      : 'menu/native_src/ui/font_stb.cpp',
-  'nm_loc_xml'       : 'menu/native_src/ui/loc_xml.cpp',
-  'nm_hmmsys'        : 'menu/native_src/vfs/hmmsys.cpp',
-  'nm_lzis'          : 'menu/native_src/vfs/lzis.cpp',
-  'nm_menu_widgets'  : 'menu/native_src/ui/menu_widgets.cpp',
-  'nm_load_game_menu': 'menu/native_src/ui/load_game_menu.cpp',
-  'nm_ini_file'      : 'menu/native_src/ui/ini_file.cpp',
-}
-
-foreach name, src : menu_native_sources
-  special_libs += static_library(name, src,
-    cpp_args : menu_cpp_args,
-    include_directories : menu_inc,
-  )
-endforeach
-
-special_libs += static_library('nm_dialog',
-  'menu/native_src/ui/dialog.cpp',
-  cpp_args : menu_cpp_args + ['-fexceptions'],
-  override_options : ['cpp_eh=default'],
-  include_directories : menu_inc,
-)
-
-special_libs += static_library('iconv_stub',
-  'menu/iconv_compat/iconv_stub.c',
+special_libs += static_library('ck_menu_stub',
+  'menu/ck_menu_stub.c',
   c_args : win_defs_xp + c_warn,
-  include_directories : include_directories('menu/iconv_compat'),
+  include_directories : include_directories('menu'),
 )
 
 # --- Win32 link libraries ------------------------------------------------
