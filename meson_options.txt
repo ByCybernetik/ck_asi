@@ -1,0 +1,2 @@
+option('gpu_scene', type : 'boolean', value : true,
+       description : 'Build GPU terrain/decor/obj modules (vk_terrain, vk_decor, vk_obj, etc.)')

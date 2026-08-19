@@ -6,9 +6,26 @@ cutscenes, CVM — now as **`CK.asi`**, injected by a thin **`winmm.dll`** loade
 
 ## Build
 
+### Meson (recommended)
+
 ```bash
-make            # CK.asi + loader/winmm.dll
-make install    # → ../Imperivm/scripts/CK.asi + ../Imperivm/winmm.dll
+meson setup builddir --cross-file cross/i686-w64-mingw32.txt
+meson compile -C builddir
+```
+
+Without GPU terrain/decor/obj rendering:
+
+```bash
+meson setup builddir --cross-file cross/i686-w64-mingw32.txt -Dgpu_scene=false
+meson compile -C builddir
+```
+
+### Make (legacy)
+
+```bash
+make                # CK.asi + winmm.dll
+make GPU_SCENE=0    # without GPU scene modules
+make install        # → ../Imperivm/scripts/CK.asi + ../Imperivm/winmm.dll
 ```
 
 Needs `i686-w64-mingw32-gcc` and Vulkan headers (`/usr/include/vulkan`).
@@ -17,9 +34,12 @@ Needs `i686-w64-mingw32-gcc` and Vulkan headers (`/usr/include/vulkan`).
 
 | Path | Role |
 |------|------|
-| `CK.asi` | Game hooks + Vulkan (this project) |
-| `loader/winmm.dll` | Forwards real winmm, `LoadLibrary(scripts/CK.asi)` |
-| `hooks.c` / `vk_present.c` / `movie_player.c` | Core logic |
+| `src/` | All source code |
+| `src/loader/` | winmm.dll proxy loader |
+| `src/menu/` | Native menu system (C++) |
+| `src/shaders/` | GLSL shaders + SPIR-V headers |
+| `cross/` | Meson cross-compilation files |
+| `deps/freetype/` | Vendored FreeType (include + lib) |
 
 ## Run (Wine)
 

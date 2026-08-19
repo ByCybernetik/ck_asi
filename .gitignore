@@ -1,9 +1,13 @@
-# Ignore build artifacts
+# Build artifacts
 *.o
 *.asi
 *.dll
 *.log
 *.exe
+
+# Meson build directory
+builddir/
+build/
 
 # VQ→KTX2 converter outputs
 ktx2_out/
