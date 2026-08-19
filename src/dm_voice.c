@@ -1500,6 +1500,7 @@ static HRESULT play_pcm_music_wasapi(CkPerf *perf, CkSegment *seg, CkPath *apath
         free(raw);
         return E_NOTIMPL;
     }
+    free(raw);
 
     EnterCriticalSection(&perf->lock);
     old_buf = perf->music_buf;

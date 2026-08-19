@@ -324,7 +324,7 @@ void audio_wasapi_shutdown(void)
     memset(s, 0, sizeof(*s));
 }
 
-int audio_wasapi_play_ogg(BYTE *ogg_data, DWORD ogg_len, int loop, LONG vol, DWORD *duration_ms_out)
+int audio_wasapi_play_ogg(const BYTE *ogg_data, DWORD ogg_len, int loop, LONG vol, DWORD *duration_ms_out)
 {
     WasapiState *s = &g_wasapi;
     stb_vorbis *v;
@@ -332,16 +332,25 @@ int audio_wasapi_play_ogg(BYTE *ogg_data, DWORD ogg_len, int loop, LONG vol, DWO
     float dur_sec;
     int err = 0;
     int need;
+    BYTE *copy;
 
     if (!s->thread || !ogg_data || !ogg_len)
         return 0;
 
-    v = stb_vorbis_open_memory(ogg_data, (int)ogg_len, &err, NULL);
-    if (!v)
+    copy = (BYTE *)malloc(ogg_len);
+    if (!copy)
         return 0;
+    memcpy(copy, ogg_data, ogg_len);
+
+    v = stb_vorbis_open_memory(copy, (int)ogg_len, &err, NULL);
+    if (!v) {
+        free(copy);
+        return 0;
+    }
     vi = stb_vorbis_get_info(v);
     if (vi.channels < 1 || vi.sample_rate < 1) {
         stb_vorbis_close(v);
+        free(copy);
         return 0;
     }
     dur_sec = stb_vorbis_stream_length_in_seconds(v);
@@ -359,6 +368,7 @@ int audio_wasapi_play_ogg(BYTE *ogg_data, DWORD ogg_len, int loop, LONG vol, DWO
         if (!nb) {
             LeaveCriticalSection(&s->lock);
             stb_vorbis_close(v);
+            free(copy);
             return 0;
         }
         s->decode_buf = nb;
@@ -368,7 +378,7 @@ int audio_wasapi_play_ogg(BYTE *ogg_data, DWORD ogg_len, int loop, LONG vol, DWO
         stb_vorbis_close(s->vorbis);
     free(s->ogg_data);
     s->vorbis = v;
-    s->ogg_data = ogg_data;
+    s->ogg_data = copy;
     s->ogg_len = ogg_len;
     s->vorbis_ch = vi.channels;
     s->vorbis_rate = (int)vi.sample_rate;
