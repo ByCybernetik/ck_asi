@@ -20,6 +20,7 @@ extern int stb_vorbis_get_samples_short_interleaved(stb_vorbis *f, int channels,
                                                      int num_shorts);
 extern void stb_vorbis_close(stb_vorbis *f);
 extern int stb_vorbis_seek_start(stb_vorbis *f);
+extern float stb_vorbis_stream_length_in_seconds(stb_vorbis *f);
 
 typedef struct {
     IMMDevice *dev;
@@ -43,12 +44,15 @@ typedef struct {
     int mix_float;
 
     short *decode_buf;
-    int decode_buf_samples;
+    int decode_buf_cap;
+    int decode_buf_pos;
+    int decode_buf_len;
+    double resample_frac;
 } WasapiState;
 
 static WasapiState g_wasapi;
 
-enum { DECODE_CHUNK = 4096 };
+enum { DECODE_CHUNK = 2048 };
 
 static float dsvol_to_linear(LONG vol)
 {
@@ -59,108 +63,126 @@ static float dsvol_to_linear(LONG vol)
     return (float)pow(10.0, (double)vol / 2000.0);
 }
 
+static int wasapi_decode_more(WasapiState *s)
+{
+    int got;
+    if (!s->vorbis)
+        return 0;
+    got = stb_vorbis_get_samples_short_interleaved(
+        s->vorbis, s->vorbis_ch, s->decode_buf,
+        DECODE_CHUNK * s->vorbis_ch);
+    if (got <= 0)
+        return 0;
+    s->decode_buf_pos = 0;
+    s->decode_buf_len = got;
+    return got;
+}
+
+static void wasapi_read_frame(WasapiState *s, float *l, float *r)
+{
+    int idx, vch;
+    short *buf;
+
+    *l = 0.0f;
+    *r = 0.0f;
+
+    if (s->decode_buf_pos >= s->decode_buf_len) {
+        if (!wasapi_decode_more(s)) {
+            if (s->loop) {
+                stb_vorbis_seek_start(s->vorbis);
+                if (!wasapi_decode_more(s)) {
+                    s->active = 0;
+                    return;
+                }
+            } else {
+                s->active = 0;
+                return;
+            }
+        }
+    }
+
+    vch = s->vorbis_ch;
+    buf = s->decode_buf;
+    idx = s->decode_buf_pos * vch;
+
+    if (vch >= 2) {
+        *l = (float)buf[idx + 0] / 32768.0f;
+        *r = (float)buf[idx + 1] / 32768.0f;
+    } else {
+        *l = *r = (float)buf[idx] / 32768.0f;
+    }
+}
+
 static void wasapi_fill(BYTE *dst, UINT32 frames)
 {
-    UINT32 ch, f, wrote;
+    UINT32 ch, f;
     float gain;
+    double step;
     WasapiState *s = &g_wasapi;
     if (!dst || !s->mixfmt)
         return;
     ch = s->mixfmt->nChannels ? s->mixfmt->nChannels : 2;
     gain = dsvol_to_linear(s->vol);
-    wrote = 0;
 
-    while (wrote < frames) {
-        UINT32 need = frames - wrote;
-        UINT32 have = 0;
-        int got;
+    if (!s->active || !s->vorbis || s->vorbis_rate < 1) {
+        if (s->mix_float)
+            memset(dst, 0, frames * ch * sizeof(float));
+        else
+            memset(dst, 0, frames * ch * sizeof(short));
+        return;
+    }
 
-        if (!s->active || !s->vorbis) {
-            if (s->mix_float) {
-                float *out = (float *)dst + wrote * ch;
-                for (f = 0; f < need * ch; ++f)
-                    out[f] = 0.0f;
-            } else {
-                memset((short *)dst + wrote * ch, 0, need * ch * sizeof(short));
+    step = (double)s->vorbis_rate / (double)s->mixfmt->nSamplesPerSec;
+
+    if (s->mix_float) {
+        float *out = (float *)dst;
+        for (f = 0; f < frames; ++f) {
+            float l, r;
+            UINT32 c;
+            while (s->resample_frac >= 1.0) {
+                s->decode_buf_pos++;
+                s->resample_frac -= 1.0;
             }
-            return;
-        }
-
-        if (need > (UINT32)DECODE_CHUNK)
-            need = DECODE_CHUNK;
-
-        got = stb_vorbis_get_samples_short_interleaved(
-            s->vorbis, s->vorbis_ch, s->decode_buf, (int)(need * s->vorbis_ch));
-
-        if (got <= 0) {
-            if (s->loop) {
-                stb_vorbis_seek_start(s->vorbis);
-                continue;
-            }
-            s->active = 0;
-            if (s->mix_float) {
-                float *out = (float *)dst + wrote * ch;
-                for (f = 0; f < (frames - wrote) * ch; ++f)
-                    out[f] = 0.0f;
-            } else {
-                memset((short *)dst + wrote * ch, 0,
-                       (frames - wrote) * ch * sizeof(short));
-            }
-            return;
-        }
-        have = (UINT32)got;
-
-        if (s->mix_float) {
-            float *out = (float *)dst + wrote * ch;
-            double step = (double)s->vorbis_rate / (double)s->mixfmt->nSamplesPerSec;
-            double pos = 0.0;
-            UINT32 out_frames = (UINT32)((double)have / step);
-            if (out_frames > frames - wrote)
-                out_frames = frames - wrote;
-            for (f = 0; f < out_frames; ++f) {
-                UINT32 si = (UINT32)pos;
-                float l, r;
-                if (si >= have) si = have - 1;
-                if (s->vorbis_ch >= 2) {
-                    l = (float)s->decode_buf[si * 2 + 0] / 32768.0f;
-                    r = (float)s->decode_buf[si * 2 + 1] / 32768.0f;
-                } else {
-                    l = r = (float)s->decode_buf[si] / 32768.0f;
+            wasapi_read_frame(s, &l, &r);
+            if (!s->active) {
+                for (; f < frames; ++f) {
+                    for (c = 0; c < ch; ++c)
+                        out[f * ch + c] = 0.0f;
                 }
-                l *= gain; r *= gain;
-                out[f * ch + 0] = l;
-                if (ch > 1) out[f * ch + 1] = r;
-                for (UINT32 c = 2; c < ch; ++c)
-                    out[f * ch + c] = 0.0f;
-                pos += step;
+                return;
             }
-            wrote += out_frames;
-        } else {
-            double step = (double)s->vorbis_rate / (double)s->mixfmt->nSamplesPerSec;
-            double pos = 0.0;
-            short *out = (short *)dst + wrote * ch;
-            UINT32 out_frames = (UINT32)((double)have / step);
-            if (out_frames > frames - wrote)
-                out_frames = frames - wrote;
-            for (f = 0; f < out_frames; ++f) {
-                UINT32 si = (UINT32)pos;
-                int l, r;
-                if (si >= have) si = have - 1;
-                if (s->vorbis_ch >= 2) {
-                    l = s->decode_buf[si * 2 + 0];
-                    r = s->decode_buf[si * 2 + 1];
-                } else {
-                    l = r = s->decode_buf[si];
+            l *= gain;
+            r *= gain;
+            out[f * ch + 0] = l;
+            if (ch > 1) out[f * ch + 1] = r;
+            for (c = 2; c < ch; ++c)
+                out[f * ch + c] = 0.0f;
+            s->resample_frac += step;
+        }
+    } else {
+        short *out = (short *)dst;
+        for (f = 0; f < frames; ++f) {
+            float l, r;
+            UINT32 c;
+            while (s->resample_frac >= 1.0) {
+                s->decode_buf_pos++;
+                s->resample_frac -= 1.0;
+            }
+            wasapi_read_frame(s, &l, &r);
+            if (!s->active) {
+                for (; f < frames; ++f) {
+                    for (c = 0; c < ch; ++c)
+                        out[f * ch + c] = 0;
                 }
-                l = (int)((float)l * gain);
-                r = (int)((float)r * gain);
-                out[f * ch + 0] = (short)l;
-                if (ch > 1) out[f * ch + 1] = (short)r;
-                for (UINT32 c = 2; c < ch; ++c)
-                    out[f * ch + c] = 0;
-                pos += step;
+                return;
             }
-            wrote += out_frames;
+            l *= gain;
+            r *= gain;
+            out[f * ch + 0] = (short)(l * 32767.0f);
+            if (ch > 1) out[f * ch + 1] = (short)(r * 32767.0f);
+            for (c = 2; c < ch; ++c)
+                out[f * ch + c] = 0;
+            s->resample_frac += step;
         }
     }
 }
@@ -243,18 +265,18 @@ int audio_wasapi_init(HWND hwnd)
     s->lock_ready = 1;
     s->vol = 0;
     s->mix_float = (s->mixfmt->wBitsPerSample == 32) ? 1 : 0;
-    s->decode_buf = (short *)malloc(DECODE_CHUNK * 2 * sizeof(short));
+    s->decode_buf = (short *)malloc(DECODE_CHUNK * 8 * sizeof(short));
+    s->decode_buf_cap = DECODE_CHUNK * 8;
     if (!s->decode_buf)
         goto fail;
-    s->decode_buf_samples = DECODE_CHUNK * 2;
     s->run = 1;
     s->thread = CreateThread(NULL, 0, wasapi_thread_proc, s, 0, NULL);
     if (!s->thread)
         goto fail;
     IMMDeviceEnumerator_Release(en);
-    log_msg("dm-replace: WASAPI streaming init ok mixfmt=%uHz %uch %ubit",
+    log_msg("dm-replace: WASAPI streaming init ok mixfmt=%uHz %uch %ubit float=%d",
             (unsigned)s->mixfmt->nSamplesPerSec, (unsigned)s->mixfmt->nChannels,
-            (unsigned)s->mixfmt->wBitsPerSample);
+            (unsigned)s->mixfmt->wBitsPerSample, s->mix_float);
     return 1;
 fail:
     if (en)
@@ -309,7 +331,7 @@ int audio_wasapi_play_ogg(BYTE *ogg_data, DWORD ogg_len, int loop, LONG vol, DWO
     stb_vorbis_info vi;
     float dur_sec;
     int err = 0;
-    extern float stb_vorbis_stream_length_in_seconds(stb_vorbis *f);
+    int need;
 
     if (!s->thread || !ogg_data || !ogg_len)
         return 0;
@@ -331,18 +353,16 @@ int audio_wasapi_play_ogg(BYTE *ogg_data, DWORD ogg_len, int loop, LONG vol, DWO
     }
 
     EnterCriticalSection(&s->lock);
-    {
-        int need_samples = DECODE_CHUNK * ((vi.channels > 0) ? vi.channels : 2);
-        if (need_samples > s->decode_buf_samples) {
-            short *nb = (short *)realloc(s->decode_buf, (size_t)need_samples * sizeof(short));
-            if (!nb) {
-                LeaveCriticalSection(&s->lock);
-                stb_vorbis_close(v);
-                return 0;
-            }
-            s->decode_buf = nb;
-            s->decode_buf_samples = need_samples;
+    need = DECODE_CHUNK * vi.channels;
+    if (need > s->decode_buf_cap) {
+        short *nb = (short *)realloc(s->decode_buf, (size_t)need * sizeof(short));
+        if (!nb) {
+            LeaveCriticalSection(&s->lock);
+            stb_vorbis_close(v);
+            return 0;
         }
+        s->decode_buf = nb;
+        s->decode_buf_cap = need;
     }
     if (s->vorbis)
         stb_vorbis_close(s->vorbis);
@@ -354,10 +374,15 @@ int audio_wasapi_play_ogg(BYTE *ogg_data, DWORD ogg_len, int loop, LONG vol, DWO
     s->vorbis_rate = (int)vi.sample_rate;
     s->loop = loop ? 1 : 0;
     s->vol = vol;
+    s->decode_buf_pos = 0;
+    s->decode_buf_len = 0;
+    s->resample_frac = 0.0;
     s->active = 1;
     LeaveCriticalSection(&s->lock);
     if (s->ev)
         SetEvent(s->ev);
+    log_msg("dm-replace: WASAPI play ogg %luB %dch %dHz loop=%d dur=%.1fs",
+            (unsigned long)ogg_len, vi.channels, (int)vi.sample_rate, loop, (double)dur_sec);
     return 1;
 }
 
@@ -375,6 +400,9 @@ void audio_wasapi_stop(void)
     free(s->ogg_data);
     s->ogg_data = NULL;
     s->ogg_len = 0;
+    s->decode_buf_pos = 0;
+    s->decode_buf_len = 0;
+    s->resample_frac = 0.0;
     LeaveCriticalSection(&s->lock);
 }
 
