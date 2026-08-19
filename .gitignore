@@ -1,0 +1,12 @@
+# Ignore build artifacts
+*.o
+*.asi
+*.dll
+*.log
+*.exe
+
+# VQ→KTX2 converter outputs
+ktx2_out/
+ktx2_out_smoke/
+ktx/terrain/**/*.ktx2
+ktx/terrain/**/*.png

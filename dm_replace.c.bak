@@ -1,0 +1,3977 @@
+#include "dm_replace.h"
+#include "hooks.h"
+#include "hitch.h"
+#include "log.h"
+#include "vk_present.h"
+
+#include <dsound.h>
+#include <mmreg.h>
+#include <math.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+/* stb_vorbis (compiled as stb_vorbis.o) — capped decode, never full-track PCM */
+typedef struct stb_vorbis stb_vorbis;
+typedef struct {
+    unsigned int sample_rate;
+    int channels;
+    unsigned int setup_memory_required;
+    unsigned int setup_temp_memory_required;
+    unsigned int temp_memory_required;
+    int max_frame_size;
+} stb_vorbis_info;
+typedef struct {
+    char *alloc_buffer;
+    int alloc_buffer_length_in_bytes;
+} stb_vorbis_alloc;
+extern stb_vorbis *stb_vorbis_open_memory(const unsigned char *data, int len, int *error,
+                                         const stb_vorbis_alloc *alloc);
+extern stb_vorbis_info stb_vorbis_get_info(stb_vorbis *f);
+extern int stb_vorbis_get_samples_short_interleaved(stb_vorbis *f, int channels, short *buffer,
+                                                    int num_shorts);
+extern int stb_vorbis_decode_memory(const unsigned char *mem, int len, int *channels,
+                                    int *sample_rate, short **output);
+extern void stb_vorbis_close(stb_vorbis *f);
+
+enum {
+    OGG_DECODE_MAX_SEC = 30,  /* sfx/ambient ogg */
+    OGG_DECODE_FULL = -1,     /* music: decode entire track (must be <0, not 0) */
+};
+
+/*
+ * Replace DirectMusic with: IStream(RIFF) → PCM → DirectSound secondary buffers.
+ * Contract from runtime trace (session 764ba7):
+ *   CoCreate Loader+Perf → InitAudio(0x3F) → CreateStandardAudioPath
+ *   → GetObject(STREAM|CLASS Segment) → Download(path) → PlaySegmentEx(flags^0x80)
+ */
+
+
+static int g_enabled;
+
+static void dm_agent(const char *hid, const char *loc, const char *msg, const char *data_json)
+{
+    (void)hid;
+    (void)loc;
+    (void)msg;
+    (void)data_json;
+}
+
+/* #region agent log — last COM hits before AV (no I/O on hot path) */
+enum { CK_RING_N = 32 };
+static struct {
+    DWORD tick;
+    DWORD tid;
+    int kind; /* 1=seg 2=SetRep 3=DL 4=QI 5=GetNotif 6=Play 7=GetLen 8=path */
+    int slot;
+} g_ck_ring[CK_RING_N];
+static volatile LONG g_ck_ring_i;
+
+static void ck_ring_push(int kind, int slot)
+{
+    LONG i = InterlockedIncrement(&g_ck_ring_i) - 1;
+    int j = (int)(i & (CK_RING_N - 1));
+    g_ck_ring[j].tick = GetTickCount();
+    g_ck_ring[j].tid = GetCurrentThreadId();
+    g_ck_ring[j].kind = kind;
+    g_ck_ring[j].slot = slot;
+}
+
+static void ck_ring_dump(const char *why)
+{
+    char js[720];
+    int n = (int)g_ck_ring_i;
+    int start = n > CK_RING_N ? n - CK_RING_N : 0;
+    int pos;
+    int k;
+    pos = snprintf(js, sizeof(js), "{\"why\":\"%.24s\",\"n\":%d,\"hits\":[", why ? why : "?", n);
+    for (k = start; k < n && pos + 40 < (int)sizeof(js); ++k) {
+        int j = k & (CK_RING_N - 1);
+        pos += snprintf(js + pos, sizeof(js) - (size_t)pos, "%s{\"t\":%lu,\"tid\":%lu,\"k\":%d,\"s\":%d}",
+                        k > start ? "," : "", (unsigned long)g_ck_ring[j].tick,
+                        (unsigned long)g_ck_ring[j].tid, g_ck_ring[j].kind, g_ck_ring[j].slot);
+    }
+    if (pos + 3 < (int)sizeof(js)) {
+        js[pos++] = ']';
+        js[pos++] = '}';
+        js[pos] = '\0';
+    }
+    dm_agent("H11", "dm_replace.c:ring", "call-ring", js);
+}
+/* #endregion */
+
+/* #region agent log */
+static LONG CALLBACK ck_veh(struct _EXCEPTION_POINTERS *ep)
+{
+    static volatile LONG s_av_n;
+    char js[280];
+    char ctx[360];
+    char modpath[MAX_PATH];
+    DWORD code, addr, eip, info0 = 0, info1 = 0;
+    DWORD mod_base = 0, eip_rva = 0;
+    LONG n;
+    MEMORY_BASIC_INFORMATION mbi;
+    HMODULE hm;
+
+    if (!ep || !ep->ExceptionRecord)
+        return EXCEPTION_CONTINUE_SEARCH;
+    code = ep->ExceptionRecord->ExceptionCode;
+    /* DBG_PRINTEXCEPTION_C / OUTPUT_DEBUG_STRING and C++ EH — ignore */
+    if (code == 0x40010006 || code == 0x40010007 || code == 0xE06D7363 || code == 0x406D1388)
+        return EXCEPTION_CONTINUE_SEARCH;
+    /* #region agent log — H70: non-AV fatals (stack/illegal) before exit */
+    if (code != 0xC0000005) {
+        if (code == 0xC00000FD || code == 0xC000001D || code == 0xC0000096 || code == 0x80000003) {
+            n = InterlockedIncrement(&s_av_n);
+            addr = (DWORD)(ULONG_PTR)ep->ExceptionRecord->ExceptionAddress;
+            eip = ep->ContextRecord ? (DWORD)ep->ContextRecord->Eip : 0;
+            hooks_get_crash_ctx(ctx, sizeof(ctx));
+            log_msg("VEH-other #%ld code=0x%08lX eip=0x%08lX %s", (long)n, (unsigned long)code,
+                    (unsigned long)eip, ctx);
+            if (n <= 8) {
+                snprintf(js, sizeof(js),
+                         "{\"n\":%ld,\"code\":%lu,\"addr\":%lu,\"eip\":%lu,\"eip_hex\":\"0x%08lX\"}",
+                         (long)n, (unsigned long)code, (unsigned long)addr, (unsigned long)eip,
+                         (unsigned long)eip);
+                dm_agent("H70", "dm_replace.c:VEH", "crash-other", js);
+            }
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    /* #endregion */
+    n = InterlockedIncrement(&s_av_n);
+    addr = (DWORD)(ULONG_PTR)ep->ExceptionRecord->ExceptionAddress;
+    eip = ep->ContextRecord ? (DWORD)ep->ContextRecord->Eip : 0;
+    if (ep->ExceptionRecord->NumberParameters >= 2) {
+        info0 = (DWORD)ep->ExceptionRecord->ExceptionInformation[0];
+        info1 = (DWORD)ep->ExceptionRecord->ExceptionInformation[1];
+    }
+    modpath[0] = '\0';
+    if (VirtualQuery((void *)(ULONG_PTR)eip, &mbi, sizeof(mbi))) {
+        mod_base = (DWORD)(ULONG_PTR)mbi.AllocationBase;
+        if (mod_base)
+            eip_rva = eip - mod_base;
+        hm = (HMODULE)mbi.AllocationBase;
+        if (hm)
+            GetModuleFileNameA(hm, modpath, MAX_PATH);
+    }
+    {
+        char *p;
+        for (p = modpath; *p; ++p) {
+            if (*p == '\\' || *p == '"')
+                *p = '/';
+        }
+    }
+    hooks_get_crash_ctx(ctx, sizeof(ctx));
+    /* Always write ck_asi.log (NDJSON capped) — editor test AVs were lost after n>3. */
+    log_msg("VEH-AV #%ld eip=0x%08lX rva=0x%08lX av=0x%08lX rw=%lu mod=%s | %s", (long)n,
+            (unsigned long)eip, (unsigned long)eip_rva, (unsigned long)info1, (unsigned long)info0,
+            modpath[0] ? modpath : "?", ctx);
+    if (n > 12)
+        return EXCEPTION_CONTINUE_SEARCH;
+    /* #region agent log — H22/H24: dump regs+stack at AV */
+    {
+        char js2[640];
+        CONTEXT *c = ep->ContextRecord;
+        DWORD *sp;
+        DWORD s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0, s6 = 0, s7 = 0;
+        if (c) {
+            sp = (DWORD *)(ULONG_PTR)c->Esp;
+            if (!IsBadReadPtr(sp, 32)) {
+                s0 = sp[0];
+                s1 = sp[1];
+                s2 = sp[2];
+                s3 = sp[3];
+                s4 = sp[4];
+                s5 = sp[5];
+                s6 = sp[6];
+                s7 = sp[7];
+            }
+            /* #region agent log */
+            {
+                extern volatile LONG g_scan_clamps;
+                snprintf(js2, sizeof(js2),
+                         "{\"n\":%ld,\"eip\":%lu,\"eip_hex\":\"0x%08lX\",\"rva\":%lu,"
+                         "\"mod_base\":%lu,\"mod\":\"%.160s\",\"eax\":%lu,\"ebx\":%lu,\"ecx\":%lu,"
+                         "\"edx\":%lu,\"esi\":%lu,\"edi\":%lu,\"ebp\":%lu,\"esp\":%lu,\"rw\":%lu,"
+                         "\"av\":%lu,\"s0\":%lu,\"s1\":%lu,\"s2\":%lu,\"s3\":%lu,\"s4\":%lu,"
+                         "\"s5\":%lu,\"s6\":%lu,\"s7\":%lu,\"scan_clamps\":%ld,\"ctx\":\"%.200s\"}",
+                         (long)n, (unsigned long)eip, (unsigned long)eip, (unsigned long)eip_rva,
+                         (unsigned long)mod_base, modpath, (unsigned long)c->Eax,
+                         (unsigned long)c->Ebx, (unsigned long)c->Ecx, (unsigned long)c->Edx,
+                         (unsigned long)c->Esi, (unsigned long)c->Edi, (unsigned long)c->Ebp,
+                         (unsigned long)c->Esp, (unsigned long)info0, (unsigned long)info1,
+                         (unsigned long)s0, (unsigned long)s1, (unsigned long)s2, (unsigned long)s3,
+                         (unsigned long)s4, (unsigned long)s5, (unsigned long)s6, (unsigned long)s7,
+                         (long)g_scan_clamps, ctx);
+                dm_agent("H24", "dm_replace.c:VEH", "crash-ctx", js2);
+            }
+            /* #endregion */
+        }
+    }
+    /* #endregion */
+    snprintf(js, sizeof(js),
+             "{\"n\":%ld,\"code\":%lu,\"addr\":%lu,\"eip\":%lu,\"eip_hex\":\"0x%08lX\","
+             "\"rva\":%lu,\"rw\":%lu,\"av_addr\":%lu,\"mod\":\"%.120s\"}",
+             (long)n, (unsigned long)code, (unsigned long)addr, (unsigned long)eip,
+             (unsigned long)eip, (unsigned long)eip_rva, (unsigned long)info0,
+             (unsigned long)info1, modpath);
+    dm_agent("H10", "dm_replace.c:VEH", "crash-veh", js);
+    ck_ring_dump("veh-av");
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+/* #endregion */
+
+static const GUID CLSID_DMPerformance = {
+    0xd2ac2881, 0xb39b, 0x11d1, {0x87, 0x04, 0x00, 0x60, 0x08, 0x93, 0xb1, 0xbd}};
+static const GUID CLSID_DMLoader = {
+    0xd2ac2892, 0xb39b, 0x11d1, {0x87, 0x04, 0x00, 0x60, 0x08, 0x93, 0xb1, 0xbd}};
+static const GUID CLSID_DMSegment = {
+    0xd2ac2882, 0xb39b, 0x11d1, {0x87, 0x04, 0x00, 0x60, 0x08, 0x93, 0xb1, 0xbd}};
+
+static const GUID IID_IDirectMusicPerformance8 = {
+    0x679c4137, 0xc62e, 0x4147, {0xb2, 0xb4, 0x9d, 0x56, 0x9a, 0xcb, 0x25, 0x4c}};
+static const GUID IID_IDirectMusicLoader8 = {
+    0x19e7c08c, 0x0a44, 0x4e6a, {0xa1, 0x16, 0x59, 0x5a, 0x7c, 0xd5, 0xde, 0x8c}};
+static const GUID IID_IDirectMusicSegment8 = {
+    0xc6784488, 0x41a3, 0x418f, {0xaa, 0x15, 0xb3, 0x50, 0x93, 0xba, 0x42, 0xd4}};
+static const GUID IID_IDirectMusicSegmentState8 = {
+    0xa50e4730, 0x0ae4, 0x48a7, {0x98, 0x39, 0xbc, 0x04, 0xbf, 0xe0, 0x77, 0x72}};
+
+enum {
+    PERF_VT = 56,
+    LDR_VT = 16,
+    SEG_VT = 32, /* IUnknown + Segment(23) + Segment8(5) = 31 slots used */
+    PATH_VT = 16,
+    STATE_VT = 10, /* SegmentState8: QI..GetObjectInPath */
+    PERF_IDX_STOP = 5,        /* +0x14 Stop(seg,state,time,flags) */
+    PERF_IDX_SETNOTIF = 20,   /* +0x50 */
+    PERF_IDX_GETNOTIF = 21,   /* +0x54 */
+    PERF_IDX_ADDNOTIF = 22,   /* +0x58 */
+    PERF_IDX_FREEPMSG = 17,   /* +0x44 FreePMsg — notification thread */
+    PERF_IDX_SETGLOBAL = 34,  /* +0x88 */
+    PERF_IDX_CLOSEDOWN = 38,  /* +0x98 */
+    PERF_IDX_INITAUDIO = 44,  /* +0xB0 */
+    PERF_IDX_PLAYSEGEX = 45,  /* +0xB4 */
+    PERF_IDX_STOPEX = 46,     /* +0xB8 StopEx */
+    PERF_IDX_CREATESTD = 49,  /* +0xC4 */
+    LDR_IDX_GETOBJECT = 3,
+    LDR_IDX_SETOBJECT = 4,
+    LDR_IDX_SETSEARCH = 5,
+    LDR_IDX_SCANDIR = 6,
+    LDR_IDX_CACHEOBJ = 7,
+    LDR_IDX_RELEASEOBJ = 8, /* +0x20 ReleaseObject(IUnknown*) */
+    LDR_IDX_CLEARCACHE = 9,
+    LDR_IDX_ENABLECACHE = 10,
+    LDR_IDX_COLLECTGARBAGE = 11, /* +0x2C Loader8 */
+    /* ba50 calls loader[+0x34]=slot13 after SEGEND — must be ret@8 not @16 (H52) */
+    SEG_IDX_DOWNLOAD = 29, /* Segment8::Download */
+    SEG_IDX_UNLOAD = 30,
+};
+
+enum {
+    DMUS_OBJ_CLASS = 0x001,
+    DMUS_OBJ_STREAM = 0x800
+};
+
+/* Minimal DMUS notification (game thread @ 0x40C860 waits on SEGEND). */
+static const GUID CK_GUID_NOTIFICATION_SEGMENT = {
+    0xd2ac2899, 0xb39b, 0x11d1, {0x87, 0x04, 0x00, 0x60, 0x08, 0x93, 0xb1, 0xbd}};
+#define CK_DMUS_PMSGT_NOTIFICATION 3u
+#define CK_DMUS_NOTIFICATION_SEGEND 1u
+#define CK_NOTIF_SLOTS 32
+
+typedef struct IStreamVtbl_mini {
+    HRESULT(STDMETHODCALLTYPE *QueryInterface)(void *, REFIID, void **);
+    ULONG(STDMETHODCALLTYPE *AddRef)(void *);
+    ULONG(STDMETHODCALLTYPE *Release)(void *);
+    HRESULT(STDMETHODCALLTYPE *Read)(void *, void *, ULONG, ULONG *);
+    HRESULT(STDMETHODCALLTYPE *Write)(void *, const void *, ULONG, ULONG *);
+    HRESULT(STDMETHODCALLTYPE *Seek)(void *, LARGE_INTEGER, DWORD, ULARGE_INTEGER *);
+} IStreamVtbl_mini;
+
+/* Game Sound wrapper (separate object) holds segment* at +4 and path at +0x10.
+ * Our segment is a normal COM object: vtbl + refs + payload. */
+typedef struct {
+    void **lpVtbl; /* +0x00 */
+    LONG refs;     /* +0x04 */
+    BYTE *pcm;
+    DWORD pcm_bytes;
+    WAVEFORMATEX fmt;
+    void *last_path;
+    DWORD repeats; /* SetRepeats: 0=once, (DWORD)-1=infinite (game bool true) */
+    char path[200];
+} CkSegment;
+
+typedef struct {
+    void **lpVtbl; /* +0 */
+    void *self;    /* +4 — game Download does *(audiopath+4); must be a pointer, not refs */
+    LONG refs;     /* +8 */
+    DWORD id;
+    LPDIRECTSOUNDBUFFER ctrl; /* real DS secondary (PATH_BUFFER) */
+    void *ctrl_proxy;         /* COM wrapper returned to game — intercepts SetPan */
+    LONG vol;
+    LONG pan; /* DSBPAN_LEFT..RIGHT; game SetPan via GetObjectInPath buffer */
+} CkPath;
+
+/* Proxy so game SetPan/SetVolume on PATH_BUFFER reach live SFX buffers. */
+typedef struct {
+    void **lpVtbl;
+    LONG refs;
+    CkPath *path;
+    LPDIRECTSOUNDBUFFER real;
+} CkDsCtrl;
+
+typedef struct CkState CkState;
+struct CkState {
+    void **lpVtbl;   /* +0 */
+    LONG refs;       /* +4 — native +4 is Graph vtbl (const); we only need GetSegment */
+    CkSegment *seg;  /* +8 — returned by GetSegment → QI Segment8 */
+    DWORD repeats;
+};
+
+/*
+ * Native DMUS_NOTIFICATION_PMSG (game @0x40C860): type@0x28 punk@0x34 guid@0x38 opt@0x48.
+ * Default GCC align pads after dwSize → type@0x2C — GUID mismatch, Unload never runs (H51).
+ * Must pack(4) like DirectMusic headers (no pad before REFERENCE_TIME).
+ */
+#pragma pack(push, 4)
+typedef struct {
+    DWORD dwSize;
+    LONGLONG rtTime;
+    LONGLONG mtTime;
+    DWORD dwFlags;
+    DWORD dwPChannel;
+    DWORD dwVirtualTrackID;
+    void *pTool;
+    void *pGraph;
+    DWORD dwType;
+    DWORD dwVoiceID;
+    DWORD dwGroupID;
+    void *punkUser;
+    GUID guidNotificationType;
+    DWORD dwNotificationOption;
+    DWORD dwField1;
+    DWORD dwField2;
+} CkNotifMsg;
+#pragma pack(pop)
+
+typedef struct {
+    unsigned char phase; /* 0=free 1=scheduled 2=delivered */
+    DWORD fire_ms;
+    CkNotifMsg msg;
+    CkState *state;
+} CkNotifSlot;
+
+typedef struct {
+    void **lpVtbl;
+    LONG refs;
+    LPDIRECTSOUND ds;
+    LPDIRECTSOUNDBUFFER primary;
+    LPDIRECTSOUNDBUFFER music_buf; /* looping BGM — never GC via sfx pool (H33) */
+    HWND hwnd;
+    CRITICAL_SECTION lock;
+    HANDLE notif_event;
+    int notif_segment;
+    CkNotifSlot notif[CK_NOTIF_SLOTS];
+} CkPerf;
+
+typedef struct {
+    void **lpVtbl;
+    LONG refs;
+} CkLoader;
+
+static void *g_perf_vt[PERF_VT];
+static void *g_ldr_vt[LDR_VT];
+static void *g_seg_vt[SEG_VT];
+static void *g_path_vt[PATH_VT];
+static void *g_state_vt[STATE_VT];
+static int g_vt_ready;
+static volatile LONG g_play_n;
+static volatile LONG g_get_n;
+static volatile DWORD g_path_id;
+static CkPerf *g_active_perf; /* for AudioPath::GetObjectInPath → DS buffer */
+
+/* Active SFX playback buffers — tagged by audiopath id for volume routing (H38). */
+typedef struct {
+    LPDIRECTSOUNDBUFFER b;  /* mono/stereo SFX, or L half for spatial voice */
+    LPDIRECTSOUNDBUFFER bR; /* R half for spatial voice; NULL otherwise */
+    DWORD done_tick;
+    DWORD path_id;
+    CkSegment *seg; /* H55: Unload must stop this buffer */
+    int spatial;    /* unit/building: dual L/R + camera frustum */
+    int y_ok;       /* world Y captured from pan-fn arg, not clobbered edi */
+    int xy_ok;      /* 1 = sx/sy are this source; 0 = do not invent world origin */
+    LONG sx, sy;
+    LONG ref_span;
+    LONG last_pan;
+    LONG last_yatten;
+} CkLiveBuf;
+static CkLiveBuf s_live[64];
+static int s_live_n;
+
+/* Roman Hastatus stereo beacon — loop voice + mouse pan to verify SetPan path. */
+static DWORD g_beacon_path_id;
+static LPDIRECTSOUNDBUFFER g_beacon_L;
+static LPDIRECTSOUNDBUFFER g_beacon_R;
+static LONG g_beacon_last_game_pan;
+static LONG g_beacon_last_applied;
+static LONG g_beacon_last_yatten;
+static int g_beacon_enabled = -1; /* -1 = lazy getenv */
+/*
+ * Unit-mode: game SetPan only at voice start (H-J). Poll camera frustum + frozen sx.
+ * MUST be volatile: ck_fill is only called from asm cave; -O2 otherwise DCE's the
+ * stores and constant-folds beacon_start to sxv=0 (runtime 764ba7: left-only).
+ */
+static volatile LONG g_last_onscreen_sx;
+static volatile LONG g_last_onscreen_sy;
+static volatile LONG g_last_onscreen_vt; /* transformed view top (ebp @ hook) */
+static volatile LONG g_last_onscreen_vb; /* transformed view bottom (ebx @ hook) */
+static volatile DWORD g_last_onscreen_ms;
+static volatile LONG g_beacon_sx;
+static volatile LONG g_beacon_sy;
+static volatile int g_beacon_sx_valid;
+static volatile int g_beacon_y_valid; /* world sy captured; live vt/vb via 0x47E4A0 */
+static volatile int g_last_onscreen_sy_ok;
+static volatile LONG g_beacon_ref_span;
+static CRITICAL_SECTION g_live_cs;
+static volatile LONG g_live_cs_ok;
+#define CK_CAM_PTR_VA 0x007CA604u
+#define CK_CAM_LEFT_OFF 0x4C8u
+#define CK_CAM_TOP_OFF 0x4CCu
+#define CK_CAM_RIGHT_OFF 0x4D0u
+#define CK_CAM_BOTTOM_OFF 0x4D4u
+#define CK_XFORM_RECT_VA 0x0047E4A0u
+#define CK_YATTEN_MAX 10000 /* DS silence; Y uses same pan-law as L/R quiet channel */
+#define CK_DATTEN_MAX 4500
+
+/* Game 0x47E4A0 thiscall: transform world frustum → view AABB (same space as unit x/y). */
+typedef void(__attribute__((thiscall)) *CkXformRectFn)(void *cam, LONG *out, LONG left, LONG top,
+                                                         LONG right, LONG bottom);
+
+static int cam_frustum_xform(LONG *oL, LONG *oT, LONG *oR, LONG *oB)
+{
+    DWORD cam;
+    LONG left, top, right, bottom, out[4];
+    CkXformRectFn fn;
+
+    if (IsBadReadPtr((void *)(ULONG_PTR)CK_CAM_PTR_VA, 4))
+        return 0;
+    cam = *(DWORD *)(ULONG_PTR)CK_CAM_PTR_VA;
+    if (!cam || IsBadReadPtr((void *)(ULONG_PTR)(cam + CK_CAM_BOTTOM_OFF), 4))
+        return 0;
+    if (IsBadCodePtr((FARPROC)(ULONG_PTR)CK_XFORM_RECT_VA))
+        return 0;
+    left = *(LONG *)(ULONG_PTR)(cam + CK_CAM_LEFT_OFF);
+    top = *(LONG *)(ULONG_PTR)(cam + CK_CAM_TOP_OFF);
+    right = *(LONG *)(ULONG_PTR)(cam + CK_CAM_RIGHT_OFF);
+    bottom = *(LONG *)(ULONG_PTR)(cam + CK_CAM_BOTTOM_OFF);
+    fn = (CkXformRectFn)(ULONG_PTR)CK_XFORM_RECT_VA;
+    memset(out, 0, sizeof(out));
+    fn((void *)(ULONG_PTR)cam, out, left, top, right, bottom);
+    if (oL)
+        *oL = out[0];
+    if (oT)
+        *oT = out[1];
+    if (oR)
+        *oR = out[2];
+    if (oB)
+        *oB = out[3];
+    return (out[3] > out[1]) ? 1 : 0;
+}
+
+static LONG path_clamp_vol(LONG vol)
+{
+    if (vol < -10000)
+        return -10000;
+    if (vol > 0)
+        return 0;
+    return vol;
+}
+
+static LONG path_clamp_pan(LONG pan)
+{
+    if (pan < -10000)
+        return -10000;
+    if (pan > 10000)
+        return 10000;
+    return pan;
+}
+
+static void path_apply_buf_vol(LPDIRECTSOUNDBUFFER buf, LONG vol)
+{
+    if (buf)
+        IDirectSoundBuffer_SetVolume(buf, path_clamp_vol(vol));
+}
+
+/* Wine DS SetPan on secondary buffers is inaudible (H-E, runtime 764ba7). Software L/R. */
+static void pan_gains_q15(LONG pan, int *lg, int *rg)
+{
+    pan = path_clamp_pan(pan);
+    if (pan <= 0) {
+        *lg = 32768;
+        *rg = (int)(((LONGLONG)(10000 + pan) * 32768LL) / 10000LL);
+    } else {
+        *lg = (int)(((LONGLONG)(10000 - pan) * 32768LL) / 10000LL);
+        *rg = 32768;
+    }
+}
+
+static short pcm_mul_q15(short s, int g)
+{
+    int v = (int)(((LONGLONG)s * (LONGLONG)g) >> 15);
+    if (v > 32767)
+        return 32767;
+    if (v < -32768)
+        return -32768;
+    return (short)v;
+}
+
+/* 16-bit PCM → interleaved stereo with pan. Returns stereo byte count, 0 on fail. */
+static DWORD pcm_render_panned_stereo(const BYTE *src, const WAVEFORMATEX *fmt, DWORD src_bytes,
+                                      BYTE *dst, DWORD dst_cap, LONG pan)
+{
+    int lg, rg;
+    DWORD i, frames;
+    const short *in;
+    short *out;
+
+    if (!src || !fmt || !dst || fmt->wBitsPerSample != 16 || fmt->nChannels < 1 ||
+        fmt->nChannels > 2 || src_bytes < 2)
+        return 0;
+    pan_gains_q15(pan, &lg, &rg);
+    in = (const short *)src;
+    out = (short *)dst;
+    if (fmt->nChannels == 1) {
+        frames = src_bytes / 2u;
+        if (dst_cap < frames * 4u)
+            return 0;
+        for (i = 0; i < frames; ++i) {
+            out[2 * i] = pcm_mul_q15(in[i], lg);
+            out[2 * i + 1] = pcm_mul_q15(in[i], rg);
+        }
+        return frames * 4u;
+    }
+    frames = src_bytes / 4u;
+    if (dst_cap < frames * 4u)
+        return 0;
+    for (i = 0; i < frames; ++i) {
+        out[2 * i] = pcm_mul_q15(in[2 * i], lg);
+        out[2 * i + 1] = pcm_mul_q15(in[2 * i + 1], rg);
+    }
+    return frames * 4u;
+}
+
+static void stereo_wfx_from(const WAVEFORMATEX *src, WAVEFORMATEX *dst)
+{
+    *dst = *src;
+    dst->nChannels = 2;
+    dst->nBlockAlign = (WORD)((dst->wBitsPerSample / 8) * 2);
+    dst->nAvgBytesPerSec = dst->nSamplesPerSec * dst->nBlockAlign;
+}
+
+static int ds_buf_write_all(LPDIRECTSOUNDBUFFER buf, const BYTE *data, DWORD bytes)
+{
+    LPVOID p1 = NULL, p2 = NULL;
+    DWORD n1 = 0, n2 = 0;
+    if (!buf || !data || !bytes)
+        return 0;
+    if (FAILED(IDirectSoundBuffer_Lock(buf, 0, bytes, &p1, &n1, &p2, &n2, 0)))
+        return 0;
+    if (p1 && n1)
+        memcpy(p1, data, n1 > bytes ? bytes : n1);
+    if (p2 && n2 && n1 < bytes)
+        memcpy(p2, data + n1, n2 > (bytes - n1) ? (bytes - n1) : n2);
+    IDirectSoundBuffer_Unlock(buf, p1, n1, p2, n2);
+    return 1;
+}
+
+static void path_apply_buf_pan(LPDIRECTSOUNDBUFFER buf, LONG pan)
+{
+    /* Kept for ctrl silence buffers; live SFX use software pan (H-E). */
+    if (buf)
+        IDirectSoundBuffer_SetPan(buf, path_clamp_pan(pan));
+}
+
+/* Beacon: dual L/R half-buffers + SetVolume (frame tick; no Stop/rewrite lag). */
+/* DS SetVolume is centibels (1/100 dB), NOT linear amplitude (H-L: linear map → hard L/R). */
+static LONG q15_to_dsvol(int g)
+{
+    double r;
+    LONG v;
+
+    if (g <= 0)
+        return -10000;
+    if (g >= 32768)
+        return 0;
+    r = (double)g / 32768.0;
+    /* 20*log10(r) in dB → *100 for DS units */
+    v = (LONG)(2000.0 * log10(r) + (r < 1.0 ? -0.5 : 0.5));
+    if (v < -10000)
+        return -10000;
+    if (v > 0)
+        return 0;
+    return v;
+}
+
+static DWORD pcm_render_one_channel(const BYTE *src, const WAVEFORMATEX *fmt, DWORD src_bytes,
+                                    BYTE *dst, DWORD dst_cap, int which)
+{
+    DWORD i, frames;
+    const short *in;
+    short *out;
+
+    if (!src || !fmt || !dst || fmt->wBitsPerSample != 16 || which < 0 || which > 1)
+        return 0;
+    in = (const short *)src;
+    out = (short *)dst;
+    if (fmt->nChannels == 1) {
+        frames = src_bytes / 2u;
+        if (dst_cap < frames * 4u)
+            return 0;
+        for (i = 0; i < frames; ++i) {
+            out[2 * i] = (which == 0) ? in[i] : 0;
+            out[2 * i + 1] = (which == 1) ? in[i] : 0;
+        }
+        return frames * 4u;
+    }
+    if (fmt->nChannels != 2)
+        return 0;
+    frames = src_bytes / 4u;
+    if (dst_cap < frames * 4u)
+        return 0;
+    for (i = 0; i < frames; ++i) {
+        short m = (short)(((int)in[2 * i] + (int)in[2 * i + 1]) / 2);
+        out[2 * i] = (which == 0) ? m : 0;
+        out[2 * i + 1] = (which == 1) ? m : 0;
+    }
+    return frames * 4u;
+}
+
+static int beacon_want(void)
+{
+    const char *e;
+    if (g_beacon_enabled < 0) {
+        e = getenv("CK_AUDIO_BEACON");
+        /* Opt-in only: looping Hastatus test. Unit voices use one-shot spatial. */
+        g_beacon_enabled = (e && e[0] == '1' && e[1] == '\0') ? 1 : 0;
+    }
+    return g_beacon_enabled;
+}
+
+static int path_is_rhastatus(const char *p)
+{
+    size_t i, n;
+    if (!p || !p[0])
+        return 0;
+    n = strlen(p);
+    for (i = 0; i + 9 <= n; ++i) {
+        char u[10];
+        size_t k;
+        for (k = 0; k < 9; ++k)
+            u[k] = (char)toupper((unsigned char)p[i + k]);
+        u[9] = '\0';
+        if (memcmp(u, "RHASTATUS", 9) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* Unit speech under CurrentLang/voices/... or VOICES\... — not music/SFX. */
+static int path_is_unit_voice(const char *p)
+{
+    char t[260];
+    size_t i;
+    if (!p || !p[0])
+        return 0;
+    for (i = 0; p[i] && i + 1 < sizeof(t); ++i) {
+        char c = p[i];
+        if (c >= 'a' && c <= 'z')
+            c = (char)(c - 'a' + 'A');
+        if (c == '/')
+            c = '\\';
+        t[i] = c;
+    }
+    t[i] = '\0';
+    return strstr(t, "VOICES\\") != NULL || strstr(t, "\\VOICES") != NULL;
+}
+
+/* Building/object selection + gates — same world pan as units (SOUNDS\SELECTION\...). */
+static int path_is_building_sfx(const char *p)
+{
+    char t[260];
+    size_t i;
+    if (!p || !p[0])
+        return 0;
+    for (i = 0; p[i] && i + 1 < sizeof(t); ++i) {
+        char c = p[i];
+        if (c >= 'a' && c <= 'z')
+            c = (char)(c - 'a' + 'A');
+        if (c == '/')
+            c = '\\';
+        t[i] = c;
+    }
+    t[i] = '\0';
+    return strstr(t, "SELECTION\\") != NULL || strstr(t, "\\SELECTION") != NULL ||
+           strstr(t, "GATES\\") != NULL || strstr(t, "\\GATES") != NULL;
+}
+
+/* Birds/waves/wind + map animals — world-positioned environment (not UI/music). */
+static int path_is_ambient_sfx(const char *p)
+{
+    char t[260];
+    size_t i;
+    if (!p || !p[0])
+        return 0;
+    for (i = 0; p[i] && i + 1 < sizeof(t); ++i) {
+        char c = p[i];
+        if (c >= 'a' && c <= 'z')
+            c = (char)(c - 'a' + 'A');
+        if (c == '/')
+            c = '\\';
+        t[i] = c;
+    }
+    t[i] = '\0';
+    return strstr(t, "AMBIENT\\") != NULL || strstr(t, "\\AMBIENT") != NULL ||
+           strstr(t, "ANIMALS\\") != NULL || strstr(t, "\\ANIMALS") != NULL;
+}
+
+static int path_want_spatial(const char *p)
+{
+    return path_is_unit_voice(p) || path_is_building_sfx(p) || path_is_ambient_sfx(p);
+}
+
+/* X → stereo L/R; Y → loudness (top=farther/quieter, bottom=closer/louder). */
+static LONG mouse_spatial_soft(int *out_x, int *out_y, int *out_sw, int *out_sh, LONG *out_yatten)
+{
+    POINT pt;
+    HWND hwnd;
+    int sw = 0, sh = 0;
+    LONG pan, yatten;
+
+    if (out_x)
+        *out_x = -1;
+    if (out_y)
+        *out_y = -1;
+    if (out_sw)
+        *out_sw = 0;
+    if (out_sh)
+        *out_sh = 0;
+    if (out_yatten)
+        *out_yatten = 0;
+    if (!vk_present_soft_size(&sw, &sh) || sw <= 1 || sh <= 1)
+        return 0;
+    hwnd = vk_present_hwnd();
+    if (!GetCursorPos(&pt))
+        return 0;
+    if (hwnd)
+        ScreenToClient(hwnd, &pt);
+    if (pt.x < 0)
+        pt.x = 0;
+    if (pt.x >= sw)
+        pt.x = sw - 1;
+    if (pt.y < 0)
+        pt.y = 0;
+    if (pt.y >= sh)
+        pt.y = sh - 1;
+    if (out_x)
+        *out_x = (int)pt.x;
+    if (out_y)
+        *out_y = (int)pt.y;
+    if (out_sw)
+        *out_sw = sw;
+    if (out_sh)
+        *out_sh = sh;
+    pan = (LONG)(((LONGLONG)pt.x * 20000LL) / (LONGLONG)sw - 10000LL);
+    /* Client y=0 is top → farther/quieter. Keep mild: -1800..0 so mid-screen stays audible (H-G). */
+    yatten = -(LONG)(((LONGLONG)(sh - 1 - pt.y) * 1800LL) / (LONGLONG)(sh - 1));
+    if (yatten < -1800)
+        yatten = -1800;
+    if (yatten > 0)
+        yatten = 0;
+    if (out_yatten)
+        *out_yatten = yatten;
+    return path_clamp_pan(pan);
+}
+
+static LONG pan_from_mouse_soft(int *out_x, int *out_sw)
+{
+    int my = 0, sh = 0;
+    LONG yatten = 0;
+    return mouse_spatial_soft(out_x, &my, out_sw, &sh, &yatten);
+}
+
+static HANDLE g_beacon_timer;
+static volatile LONG g_beacon_timer_run;
+static volatile LONG g_beacon_tick_n;
+static volatile LONG g_beacon_apply_n;
+
+static void beacon_timer_stop(void)
+{
+    InterlockedExchange(&g_beacon_timer_run, 0);
+    if (g_beacon_timer) {
+        WaitForSingleObject(g_beacon_timer, 1000);
+        CloseHandle(g_beacon_timer);
+        g_beacon_timer = NULL;
+    }
+}
+
+static void beacon_stop(void)
+{
+    beacon_timer_stop();
+    if (g_beacon_L) {
+        IDirectSoundBuffer_Stop(g_beacon_L);
+        IDirectSoundBuffer_Release(g_beacon_L);
+        g_beacon_L = NULL;
+    }
+    if (g_beacon_R) {
+        IDirectSoundBuffer_Stop(g_beacon_R);
+        IDirectSoundBuffer_Release(g_beacon_R);
+        g_beacon_R = NULL;
+    }
+    g_beacon_path_id = 0;
+    g_beacon_sx_valid = 0;
+    g_beacon_y_valid = 0;
+    g_beacon_ref_span = 0;
+}
+
+static int beacon_mode_mouse(void)
+{
+    const char *e = getenv("CK_BEACON_MODE");
+    /* Default: unit (game SetPan). CK_BEACON_MODE=mouse for cursor test. */
+    return (e && (e[0] == 'm' || e[0] == 'M')) ? 1 : 0;
+}
+
+/*
+ * Live frustum: world sx vs raw L/R; world sy vs LIVE transformed view T/B (0x47E4A0).
+ * H-P: raw top/bottom ≠ sy space. H-Q: delta-tracking vt/vb drifted on orbit — xform each tick.
+ */
+static LONG unit_pan_from_camera(LONG sx, LONG sy, LONG ref_span, LONG *oleft, LONG *oright,
+                                 LONG *otop, LONG *obottom, LONG *opre, LONG *oatten, int *ok,
+                                 LONG *ospan, LONG *odatten, LONG *olateral_q, LONG *oyatten,
+                                 LONG *ovt, LONG *ovb)
+{
+    DWORD cam;
+    LONG left, right, top, bottom, span, mid, pre, ds, atten, yatten;
+    LONG vt = 0, vb = 0, vl = 0, vr = 0, vyspan;
+    double dx, dist, half, lateral, zoom, t;
+    int xok;
+
+    if (ok)
+        *ok = 0;
+    if (ospan)
+        *ospan = 0;
+    if (odatten)
+        *odatten = 0;
+    if (olateral_q)
+        *olateral_q = 0;
+    if (oyatten)
+        *oyatten = 0;
+    if (ovt)
+        *ovt = 0;
+    if (ovb)
+        *ovb = 0;
+    if (IsBadReadPtr((void *)(ULONG_PTR)CK_CAM_PTR_VA, 4))
+        return 0;
+    cam = *(DWORD *)(ULONG_PTR)CK_CAM_PTR_VA;
+    if (!cam || IsBadReadPtr((void *)(ULONG_PTR)(cam + CK_CAM_BOTTOM_OFF), 4))
+        return 0;
+    left = *(LONG *)(ULONG_PTR)(cam + CK_CAM_LEFT_OFF);
+    top = *(LONG *)(ULONG_PTR)(cam + CK_CAM_TOP_OFF);
+    right = *(LONG *)(ULONG_PTR)(cam + CK_CAM_RIGHT_OFF);
+    bottom = *(LONG *)(ULONG_PTR)(cam + CK_CAM_BOTTOM_OFF);
+    span = right - left;
+    if (span <= 0)
+        return 0;
+    mid = left + span / 2;
+    pre = (LONG)(((LONGLONG)(mid - sx) * 20000LL) / (LONGLONG)span);
+    if (pre < -10000)
+        pre = -10000;
+    if (pre > 10000)
+        pre = 10000;
+    ds = -pre;
+
+    dx = (double)sx - (double)mid;
+    dist = fabs(dx);
+    half = (double)span * 0.5;
+    if (half < 1.0)
+        half = 1.0;
+    lateral = dist / half;
+    if (ref_span <= 0)
+        ref_span = span;
+    zoom = (double)span / (double)ref_span;
+    t = (zoom - 1.0) * 1.1 + lateral * 0.75;
+    if (t < 0.0)
+        t = 0.0;
+    if (t > 2.0)
+        t = 2.0;
+    atten = (LONG)(-(double)CK_DATTEN_MAX * (t / 2.0) * (t / 2.0));
+    if (atten < -CK_DATTEN_MAX)
+        atten = -CK_DATTEN_MAX;
+    if (atten > 0)
+        atten = 0;
+
+    /* Vertical: live xform AABB vs sy (same space as on-screen test). */
+    yatten = 0;
+    xok = cam_frustum_xform(&vl, &vt, &vr, &vb);
+    if (!xok && g_last_onscreen_vb > g_last_onscreen_vt) {
+        /* Fallback: last hook bounds if thiscall fails on worker tick. */
+        vt = g_last_onscreen_vt;
+        vb = g_last_onscreen_vb;
+        xok = 1;
+    }
+    if (xok) {
+        vyspan = vb - vt;
+        if (vyspan > 0) {
+            /*
+             * vyspan~1336: mapping fade to the on-screen AABB mutes after a tiny
+             * camera nudge. Keep full volume while the unit is still in view (vert<=1),
+             * then fade over extra screen-heights off-screen (not pan-law on both ears).
+             */
+            {
+                double midy = 0.5 * (double)(vt + vb);
+                double yhalf = 0.5 * (double)vyspan;
+                double vert, off;
+                if (yhalf < 1.0)
+                    yhalf = 1.0;
+                vert = fabs((double)sy - midy) / yhalf;
+                if (vert <= 1.0) {
+                    off = 0.0;
+                    yatten = 0;
+                } else {
+                    off = vert - 1.0;
+                    if (off > 4.0)
+                        off = 4.0;
+                    /* 1 screen off ~−400; 2 ~−1600; 3 ~−3600; cap −3500 */
+                    yatten = -(LONG)(400.0 * off * off + 0.5);
+                    if (yatten < -3500)
+                        yatten = -3500;
+                    if (yatten > 0)
+                        yatten = 0;
+                }
+            }
+        }
+    }
+
+    if (oleft)
+        *oleft = left;
+    if (oright)
+        *oright = right;
+    if (otop)
+        *otop = top;
+    if (obottom)
+        *obottom = bottom;
+    if (opre)
+        *opre = pre;
+    if (oatten)
+        *oatten = atten + yatten;
+    if (ospan)
+        *ospan = span;
+    if (odatten)
+        *odatten = atten;
+    if (olateral_q)
+        *olateral_q = (LONG)(lateral * 1000.0);
+    if (oyatten)
+        *oyatten = yatten;
+    if (ovt)
+        *ovt = vt;
+    if (ovb)
+        *ovb = vb;
+    if (ok)
+        *ok = 1;
+    return path_clamp_pan(ds);
+}
+
+static void beacon_apply_spatial(int force_log)
+{
+    LONG mpan, yatten = 0;
+    int mx = 0, my = 0, sw = 0, sh = 0, lg = 0, rg = 0;
+    LONG vl, vr;
+    LONG uleft = 0, uright = 0, utop = 0, ubottom = 0, upre = 0;
+    LONG uspan = 0, udatten = 0, ulat_q = 0, uyatten = 0, uvt = 0, uvb = 0;
+    int uok = 0;
+    int mouse = beacon_mode_mouse();
+
+    if (!g_beacon_L || !g_beacon_R || !beacon_want())
+        return;
+    if (mouse) {
+        mpan = mouse_spatial_soft(&mx, &my, &sw, &sh, &yatten);
+    } else {
+        (void)vk_present_soft_size(&sw, &sh);
+        mx = -1;
+        my = -1;
+        if (g_beacon_sx_valid) {
+            mpan = unit_pan_from_camera(g_beacon_sx, g_beacon_sy, g_beacon_ref_span, &uleft, &uright,
+                                        &utop, &ubottom, &upre, &yatten, &uok, &uspan, &udatten,
+                                        &ulat_q, &uyatten, &uvt, &uvb);
+            if (uok) {
+                g_beacon_last_game_pan = mpan;
+                if (g_beacon_ref_span <= 0 && uspan > 0)
+                    g_beacon_ref_span = uspan;
+            } else {
+                mpan = path_clamp_pan(g_beacon_last_game_pan);
+                yatten = 0;
+            }
+        } else {
+            mpan = path_clamp_pan(g_beacon_last_game_pan);
+            yatten = 0;
+        }
+    }
+    if (!force_log && mpan == g_beacon_last_applied && yatten == g_beacon_last_yatten)
+        return;
+    pan_gains_q15(mpan, &lg, &rg);
+    vl = path_clamp_vol(q15_to_dsvol(lg) + yatten);
+    vr = path_clamp_vol(q15_to_dsvol(rg) + yatten);
+    IDirectSoundBuffer_SetVolume(g_beacon_L, vl);
+    IDirectSoundBuffer_SetVolume(g_beacon_R, vr);
+    g_beacon_last_applied = mpan;
+    g_beacon_last_yatten = yatten;
+    InterlockedIncrement(&g_beacon_apply_n);
+}
+
+static void spatial_tick_live(void);
+
+void dm_replace_beacon_tick(void)
+{
+    InterlockedIncrement(&g_beacon_tick_n);
+    if (g_beacon_L && g_beacon_R)
+        beacon_apply_spatial(0);
+    spatial_tick_live();
+}
+
+static DWORD WINAPI beacon_timer_proc(void *arg)
+{
+    (void)arg;
+    while (InterlockedCompareExchange(&g_beacon_timer_run, 1, 1) == 1) {
+        dm_replace_beacon_tick();
+        Sleep(16);
+    }
+    return 0;
+}
+
+static void beacon_timer_start(void)
+{
+    if (g_beacon_timer)
+        return;
+    InterlockedExchange(&g_beacon_timer_run, 1);
+    g_beacon_timer = CreateThread(NULL, 0, beacon_timer_proc, NULL, 0, NULL);
+}
+
+static LPDIRECTSOUNDBUFFER beacon_make_half(LPDIRECTSOUND ds, const WAVEFORMATEX *wfx, BYTE *pcm,
+                                            DWORD bytes, LONG base_vol, int loop)
+{
+    DSBUFFERDESC desc;
+    LPDIRECTSOUNDBUFFER buf = NULL;
+    HRESULT hr;
+
+    memset(&desc, 0, sizeof(desc));
+    desc.dwSize = sizeof(desc);
+    desc.dwFlags = DSBCAPS_LOCSOFTWARE | DSBCAPS_CTRLVOLUME | DSBCAPS_GLOBALFOCUS |
+                   DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_STATIC;
+    desc.dwBufferBytes = bytes;
+    desc.lpwfxFormat = (WAVEFORMATEX *)wfx;
+    hr = IDirectSound_CreateSoundBuffer(ds, &desc, &buf, NULL);
+    if (FAILED(hr) || !buf || !ds_buf_write_all(buf, pcm, bytes)) {
+        if (buf)
+            IDirectSoundBuffer_Release(buf);
+        return NULL;
+    }
+    path_apply_buf_vol(buf, base_vol);
+    if (FAILED(IDirectSoundBuffer_Play(buf, 0, 0, loop ? DSBPLAY_LOOPING : 0))) {
+        IDirectSoundBuffer_Release(buf);
+        return NULL;
+    }
+    return buf;
+}
+
+static void beacon_start_from_seg(CkPerf *perf, CkSegment *seg, CkPath *apath)
+{
+    WAVEFORMATEX wfx;
+    BYTE *left = NULL, *right = NULL;
+    DWORD stereo_bytes;
+    LONG base_vol;
+
+    if (!beacon_want() || !perf || !perf->ds || !seg || !seg->pcm || !seg->pcm_bytes)
+        return;
+    if (seg->fmt.wBitsPerSample != 16)
+        return;
+
+    beacon_stop();
+    stereo_wfx_from(&seg->fmt, &wfx);
+    if (seg->fmt.nChannels == 1)
+        stereo_bytes = (seg->pcm_bytes / 2u) * 4u;
+    else
+        stereo_bytes = seg->pcm_bytes;
+
+    left = (BYTE *)malloc(stereo_bytes);
+    right = (BYTE *)malloc(stereo_bytes);
+    if (!left || !right) {
+        free(left);
+        free(right);
+        return;
+    }
+    if (pcm_render_one_channel(seg->pcm, &seg->fmt, seg->pcm_bytes, left, stereo_bytes, 0) !=
+            stereo_bytes ||
+        pcm_render_one_channel(seg->pcm, &seg->fmt, seg->pcm_bytes, right, stereo_bytes, 1) !=
+            stereo_bytes) {
+        free(left);
+        free(right);
+        return;
+    }
+
+    base_vol = apath ? apath->vol : 0;
+    g_beacon_L = beacon_make_half(perf->ds, &wfx, left, stereo_bytes, base_vol, 1);
+    g_beacon_R = beacon_make_half(perf->ds, &wfx, right, stereo_bytes, base_vol, 1);
+    free(left);
+    free(right);
+    if (!g_beacon_L || !g_beacon_R) {
+        beacon_stop();
+        return;
+    }
+
+    g_beacon_path_id = apath ? apath->id : 0;
+    g_beacon_last_game_pan = apath ? apath->pan : 0;
+    g_beacon_last_applied = 0x7fffffff;
+    g_beacon_last_yatten = 0x7fffffff;
+    g_beacon_tick_n = 0;
+    g_beacon_apply_n = 0;
+    /* Lock world X/Y (SetPan only once — H-J). Live vt/vb via 0x47E4A0 each tick (H-Q). */
+    if (g_last_onscreen_ms != 0) {
+        g_beacon_sx = g_last_onscreen_sx;
+        g_beacon_sy = g_last_onscreen_sy;
+        g_beacon_sx_valid = 1;
+        g_beacon_y_valid = 1;
+    } else {
+        g_beacon_sx_valid = 0;
+        g_beacon_y_valid = 0;
+    }
+    g_beacon_ref_span = 0;
+    beacon_apply_spatial(1);
+    beacon_timer_start();
+    log_msg("dm-replace: RHASTATUS beacon unit-cam path=%lu pan=%ld sx=%ld sy=%ld sxv=%d",
+            (unsigned long)g_beacon_path_id, (long)g_beacon_last_applied, (long)g_beacon_sx,
+            (long)g_beacon_sy, g_beacon_sx_valid);
+}
+
+static void beacon_update_pan(LONG game_pan, DWORD path_id)
+{
+    if (g_beacon_L && g_beacon_path_id && path_id != g_beacon_path_id)
+        return;
+    g_beacon_last_game_pan = game_pan;
+    beacon_apply_spatial(0);
+}
+
+static void live_cs_enter(void)
+{
+    if (g_live_cs_ok)
+        EnterCriticalSection(&g_live_cs);
+}
+
+static void live_cs_leave(void)
+{
+    if (g_live_cs_ok)
+        LeaveCriticalSection(&g_live_cs);
+}
+
+static void live_free_slot(int i)
+{
+    LPDIRECTSOUNDBUFFER b, bR;
+
+    live_cs_enter();
+    if (i < 0 || i >= s_live_n) {
+        live_cs_leave();
+        return;
+    }
+    b = s_live[i].b;
+    bR = s_live[i].bR;
+    s_live[i].b = NULL;
+    s_live[i].bR = NULL;
+    s_live[i].spatial = 0;
+    s_live[i] = s_live[s_live_n - 1];
+    memset(&s_live[s_live_n - 1], 0, sizeof(s_live[0]));
+    s_live_n--;
+    live_cs_leave();
+    if (b) {
+        IDirectSoundBuffer_Stop(b);
+        IDirectSoundBuffer_Release(b);
+    }
+    if (bR) {
+        IDirectSoundBuffer_Stop(bR);
+        IDirectSoundBuffer_Release(bR);
+    }
+}
+
+static void spatial_apply_live(CkLiveBuf *lb, int force)
+{
+    LONG mpan, yatten = 0;
+    LONG uleft = 0, uright = 0, utop = 0, ubottom = 0, upre = 0;
+    LONG uspan = 0, udatten = 0, ulat_q = 0, uyatten = 0, uvt = 0, uvb = 0;
+    int uok = 0, lg = 0, rg = 0;
+    LONG vl, vr;
+    LPDIRECTSOUNDBUFFER b, bR;
+
+    if (!lb || !lb->spatial)
+        return;
+    b = lb->b;
+    bR = lb->bR;
+    if (!b || !bR)
+        return;
+    /* Ambient often has no world pan (SetPan=0). sx=0 is map origin — mute/hard-left (764ba7). */
+    if (!lb->xy_ok) {
+        mpan = 0;
+        yatten = 0;
+        uok = 1;
+    } else {
+        mpan = unit_pan_from_camera(lb->sx, lb->sy, lb->ref_span, &uleft, &uright, &utop, &ubottom,
+                                    &upre, &yatten, &uok, &uspan, &udatten, &ulat_q, &uyatten, &uvt,
+                                    &uvb);
+        if (!lb->y_ok)
+            yatten = 0;
+        if (!uok) {
+            mpan = lb->last_pan;
+            yatten = lb->y_ok ? lb->last_yatten : 0;
+            if (mpan == 0x7fffffff)
+                mpan = 0;
+            if (yatten == 0x7fffffff)
+                yatten = 0;
+        } else {
+            if (lb->ref_span <= 0 && uspan > 0)
+                lb->ref_span = uspan;
+        }
+    }
+    if (!force && mpan == lb->last_pan && yatten == lb->last_yatten)
+        return;
+    pan_gains_q15(mpan, &lg, &rg);
+    vl = path_clamp_vol(q15_to_dsvol(lg) + yatten);
+    vr = path_clamp_vol(q15_to_dsvol(rg) + yatten);
+    b = lb->b;
+    bR = lb->bR;
+    if (!b || !bR)
+        return;
+    IDirectSoundBuffer_SetVolume(b, vl);
+    IDirectSoundBuffer_SetVolume(bR, vr);
+    lb->last_pan = mpan;
+    lb->last_yatten = yatten;
+}
+
+static void spatial_tick_live(void)
+{
+    int i;
+    DWORD now = GetTickCount();
+    for (i = 0; i < s_live_n;) {
+        if ((LONG)(now - s_live[i].done_tick) >= 0) {
+            live_free_slot(i);
+            continue;
+        }
+        if (s_live[i].spatial)
+            spatial_apply_live(&s_live[i], 0);
+        i++;
+    }
+}
+
+/* Dual L/R + camera spatial. loop=1 for long ambient beds; voices/buildings stay one-shot. */
+static int spatial_voice_play(CkPerf *perf, CkSegment *seg, CkPath *apath, int loop)
+{
+    WAVEFORMATEX wfx;
+    BYTE *left = NULL, *right = NULL;
+    DWORD stereo_bytes, dur_ms, play_bytes;
+    LONG base_vol;
+    LPDIRECTSOUNDBUFFER bL = NULL, bR = NULL;
+    CkLiveBuf *lb;
+
+    if (!perf || !perf->ds || !seg || !seg->pcm || !seg->pcm_bytes)
+        return 0;
+    if (seg->fmt.wBitsPerSample != 16)
+        return 0;
+    if (s_live_n >= (int)(sizeof(s_live) / sizeof(s_live[0])))
+        return 0;
+
+    stereo_wfx_from(&seg->fmt, &wfx);
+    if (seg->fmt.nChannels == 1)
+        stereo_bytes = (seg->pcm_bytes / 2u) * 4u;
+    else
+        stereo_bytes = seg->pcm_bytes;
+    left = (BYTE *)malloc(stereo_bytes);
+    right = (BYTE *)malloc(stereo_bytes);
+    if (!left || !right) {
+        free(left);
+        free(right);
+        return 0;
+    }
+    if (pcm_render_one_channel(seg->pcm, &seg->fmt, seg->pcm_bytes, left, stereo_bytes, 0) !=
+            stereo_bytes ||
+        pcm_render_one_channel(seg->pcm, &seg->fmt, seg->pcm_bytes, right, stereo_bytes, 1) !=
+            stereo_bytes) {
+        free(left);
+        free(right);
+        return 0;
+    }
+
+    base_vol = apath ? apath->vol : 0;
+    bL = beacon_make_half(perf->ds, &wfx, left, stereo_bytes, base_vol, loop);
+    bR = beacon_make_half(perf->ds, &wfx, right, stereo_bytes, base_vol, loop);
+    free(left);
+    free(right);
+    if (!bL || !bR) {
+        if (bL)
+            IDirectSoundBuffer_Release(bL);
+        if (bR)
+            IDirectSoundBuffer_Release(bR);
+        return 0;
+    }
+
+    play_bytes = seg->pcm_bytes;
+    dur_ms = seg->fmt.nAvgBytesPerSec
+                 ? (DWORD)((ULONGLONG)play_bytes * 1000ull / seg->fmt.nAvgBytesPerSec)
+                 : 1000u;
+    if (dur_ms < 50u)
+        dur_ms = 50u;
+    dur_ms += 400u;
+
+    lb = &s_live[s_live_n];
+    memset(lb, 0, sizeof(*lb));
+    lb->b = bL;
+    lb->bR = bR;
+    lb->done_tick = loop ? (GetTickCount() + 3600000u) : (GetTickCount() + dur_ms);
+    lb->path_id = apath ? apath->id : 0;
+    lb->seg = seg;
+    lb->spatial = 1;
+    lb->y_ok = 0;
+    lb->xy_ok = 0;
+    lb->last_pan = 0x7fffffff;
+    lb->last_yatten = 0x7fffffff;
+    /*
+     * Ambient: game SetPan(path)=0 (764ba7). Do not glue to last unit/building or
+     * world origin (0,0) — that hard-pans / mutes. Center until we have emitter XY.
+     */
+    if (!path_is_ambient_sfx(seg->path) && g_last_onscreen_ms != 0) {
+        lb->sx = g_last_onscreen_sx;
+        lb->xy_ok = 1;
+        if (g_last_onscreen_sy_ok) {
+            lb->sy = g_last_onscreen_sy;
+            lb->y_ok = 1;
+        } else {
+            lb->sy = 0;
+        }
+    } else {
+        lb->sx = 0;
+        lb->sy = 0;
+    }
+    lb->ref_span = 0;
+    s_live_n++;
+    spatial_apply_live(lb, 1);
+    return 1;
+}
+
+/*
+ * Game 0x6A9F18: on-screen sources get pan=0. Replace with frustum-X pan.
+ * esi=world X, ecx=camera, eax=&pan. World Y is arg [esp+0x2C] (not edi).
+ */
+static void __attribute__((used, noinline)) ck_fill_onscreen_pan(LONG *out, LONG sx, LONG left,
+                                                                  LONG right, LONG sy_arg,
+                                                                  LONG edi_sy)
+{
+    LONG span, mid, pan;
+    int y_ok;
+
+    if (!out || IsBadWritePtr(out, sizeof(LONG)))
+        return;
+    span = right - left;
+    if (span <= 0) {
+        *out = 0;
+        return;
+    }
+    mid = left + span / 2;
+    pan = (LONG)(((LONGLONG)(mid - sx) * 20000LL) / (LONGLONG)span);
+    if (pan < -10000)
+        pan = -10000;
+    if (pan > 10000)
+        pan = 10000;
+    *out = pan;
+    /*
+     * World Y is arg1 at [esp+0x2C] in the pan fn (0x6A9DD0). edi at 0x6A9F18 is
+     * often already the Y-distance residue (sy==vb / negative) — do not use it.
+     */
+    y_ok = (sy_arg > 500 && sy_arg < 50000);
+    g_last_onscreen_sx = sx;
+    g_last_onscreen_ms = GetTickCount();
+    if (y_ok) {
+        g_last_onscreen_sy = sy_arg;
+        g_last_onscreen_sy_ok = 1;
+        g_beacon_sy = sy_arg;
+        g_beacon_y_valid = 1;
+    }
+    g_beacon_sx = sx;
+    g_beacon_sx_valid = 1;
+    (void)edi_sy;
+}
+
+static void install_onscreen_pan_fix(void)
+{
+    BYTE *site = (BYTE *)(ULONG_PTR)0x006A9F18u;
+    static BYTE *cave;
+    BYTE *p;
+    DWORD oldprot;
+    INT32 rel;
+    INT32 call_rel;
+
+    if (IsBadReadPtr(site, 6) || site[0] != 0xC7 || site[1] != 0x00) {
+        log_msg("dm-replace: onscreen pan site mismatch (skip)");
+        return;
+    }
+    cave = (BYTE *)VirtualAlloc(NULL, 160, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!cave)
+        return;
+    /*
+     * eax=&pan, esi=sx, ecx=camera. World Y is pan-fn arg1 [esp+0x2C], NOT edi
+     * (edi clobbered by Y-distance before 0x6A9F18). cdecl:
+     * ck_fill(out, sx, left, right, sy_arg, edi_sy)
+     */
+    p = cave;
+    *p++ = 0x51; /* push ecx */
+    *p++ = 0x52; /* push edx */
+    *p++ = 0x53; /* push ebx */
+    *p++ = 0x50; /* push eax — &pan */
+    *p++ = 0x57; /* push edi — edi_sy (log vs stack Y) */
+    *p++ = 0xFF;
+    *p++ = 0x74;
+    *p++ = 0x24;
+    *p++ = 0x44; /* push dword [esp+0x44] — world Y arg */
+    *p++ = 0xFF;
+    *p++ = 0xB1;
+    {
+        DWORD off = 0x4d0;
+        memcpy(p, &off, 4);
+        p += 4;
+    }
+    *p++ = 0xFF;
+    *p++ = 0xB1;
+    {
+        DWORD off = 0x4c8;
+        memcpy(p, &off, 4);
+        p += 4;
+    }
+    *p++ = 0x56; /* push esi — sx */
+    *p++ = 0xFF;
+    *p++ = 0x74;
+    *p++ = 0x24;
+    *p++ = 0x14; /* push dword [esp+0x14] — saved &pan */
+    *p++ = 0xE8;
+    call_rel = (INT32)((BYTE *)ck_fill_onscreen_pan - (p + 4));
+    memcpy(p, &call_rel, 4);
+    p += 4;
+    *p++ = 0x83;
+    *p++ = 0xC4;
+    *p++ = 0x18; /* add esp, 24 — 6 args */
+    *p++ = 0x58; /* pop eax */
+    *p++ = 0x5B; /* pop ebx */
+    *p++ = 0x5A; /* pop edx */
+    *p++ = 0x59; /* pop ecx */
+    *p++ = 0xC3;
+
+    if (!VirtualProtect(site, 6, PAGE_EXECUTE_READWRITE, &oldprot)) {
+        VirtualFree(cave, 0, MEM_RELEASE);
+        return;
+    }
+    site[0] = 0xE8;
+    rel = (INT32)(cave - (site + 5));
+    memcpy(site + 1, &rel, 4);
+    site[5] = 0x90;
+    VirtualProtect(site, 6, oldprot, &oldprot);
+    FlushInstructionCache(GetCurrentProcess(), site, 6);
+    log_msg("dm-replace: onscreen pan fix @ 0x6A9F18 (frustum-X + view-Y, eax preserved)");
+}
+
+static void path_propagate_volume(CkPath *path)
+{
+    int i;
+    LONG vol;
+
+    if (!path)
+        return;
+    vol = path_clamp_vol(path->vol);
+    if (path->ctrl)
+        IDirectSoundBuffer_SetVolume(path->ctrl, vol);
+    if (path->id == 1 && g_active_perf && g_active_perf->music_buf)
+        IDirectSoundBuffer_SetVolume(g_active_perf->music_buf, vol);
+    for (i = 0; i < s_live_n; i++) {
+        if (s_live[i].path_id != path->id)
+            continue;
+        if (s_live[i].spatial) {
+            spatial_apply_live(&s_live[i], 1);
+            continue;
+        }
+        if (s_live[i].b)
+            IDirectSoundBuffer_SetVolume(s_live[i].b, vol);
+    }
+}
+
+/* Game 0x40bbc0: GetObjectInPath(PATH_BUFFER) → IDirectSoundBuffer::SetPan — must hit SFX. */
+static void live_apply_softpan(CkLiveBuf *lb, LONG pan)
+{
+    CkSegment *seg;
+    BYTE *stereo = NULL;
+    DWORD stereo_bytes, n, play_pos = 0, write_pos = 0;
+    DWORD status = 0;
+    int was_playing, looping;
+
+    if (!lb || !lb->b || !lb->seg || !lb->seg->pcm)
+        return;
+    seg = lb->seg;
+    if (seg->fmt.wBitsPerSample != 16) {
+        IDirectSoundBuffer_SetPan(lb->b, path_clamp_pan(pan));
+        return;
+    }
+    if (seg->fmt.nChannels == 1)
+        stereo_bytes = (seg->pcm_bytes / 2u) * 4u;
+    else
+        stereo_bytes = seg->pcm_bytes;
+    stereo = (BYTE *)malloc(stereo_bytes);
+    if (!stereo)
+        return;
+    n = pcm_render_panned_stereo(seg->pcm, &seg->fmt, seg->pcm_bytes, stereo, stereo_bytes, pan);
+    if (n != stereo_bytes) {
+        free(stereo);
+        return;
+    }
+    IDirectSoundBuffer_GetStatus(lb->b, &status);
+    was_playing = (status & DSBSTATUS_PLAYING) != 0;
+    looping = (status & DSBSTATUS_LOOPING) != 0;
+    IDirectSoundBuffer_GetCurrentPosition(lb->b, &play_pos, &write_pos);
+    IDirectSoundBuffer_Stop(lb->b);
+    if (ds_buf_write_all(lb->b, stereo, n)) {
+        IDirectSoundBuffer_SetCurrentPosition(lb->b, play_pos % n);
+        if (was_playing)
+            IDirectSoundBuffer_Play(lb->b, 0, 0, looping ? DSBPLAY_LOOPING : 0);
+    }
+    free(stereo);
+}
+
+static void path_propagate_pan(CkPath *path)
+{
+    int i;
+    LONG pan;
+
+    if (!path)
+        return;
+    pan = path_clamp_pan(path->pan);
+    if (path->ctrl)
+        IDirectSoundBuffer_SetPan(path->ctrl, pan);
+    for (i = 0; i < s_live_n; i++) {
+        if (s_live[i].path_id != path->id)
+            continue;
+        if (s_live[i].spatial) {
+            /* Camera frustum owns L/R; refresh from frozen sx/sy. */
+            spatial_apply_live(&s_live[i], 0);
+            continue;
+        }
+        live_apply_softpan(&s_live[i], pan);
+    }
+}
+
+/* H59: Unload/movie must tear down looping BGM — music lives outside s_live. */
+static void stop_music_buf(void)
+{
+    CkPerf *p = g_active_perf;
+    if (!p || !p->music_buf)
+        return;
+    IDirectSoundBuffer_Stop(p->music_buf);
+    IDirectSoundBuffer_Release(p->music_buf);
+    p->music_buf = NULL;
+}
+
+void dm_replace_silence_music(void)
+{
+    stop_music_buf();
+}
+
+/* H55: Unload / menu teardown — stop DS buffers for one segment. */
+static void stop_live_for_segment(CkSegment *seg)
+{
+    int i;
+    if (!seg)
+        return;
+    for (i = 0; i < s_live_n;) {
+        if (s_live[i].seg == seg)
+            live_free_slot(i);
+        else
+            i++;
+    }
+}
+
+/* H55/H56: mission→menu or CloseDown — silence all secondary SFX. */
+static void stop_all_live_sfx(void)
+{
+    while (s_live_n > 0)
+        live_free_slot(0);
+}
+
+/* Stop prior SFX on this audiopath — native channel re-triggers (H47). */
+static void path_stop_live_sfx(DWORD path_id)
+{
+    int i;
+    if (!path_id)
+        return;
+    for (i = 0; i < s_live_n;) {
+        if (s_live[i].path_id == path_id)
+            live_free_slot(i);
+        else
+            i++;
+    }
+}
+
+static HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags);
+static int path_is_music(const char *path);
+
+static ULONG STDMETHODCALLTYPE seg_AddRef(CkSegment *This);
+
+/* H48: game notification thread clears channel+8 on SEGEND; stub never sent any. */
+static void notif_schedule_segend(CkPerf *perf, CkState *st, DWORD dur_ms)
+{
+    int i;
+    CkNotifSlot *s;
+    DWORD fire;
+
+    if (!perf || !st || !perf->notif_segment)
+        return;
+    if (dur_ms < 50u)
+        dur_ms = 50u;
+    fire = GetTickCount() + dur_ms;
+
+    EnterCriticalSection(&perf->lock);
+    for (i = 0; i < CK_NOTIF_SLOTS; i++) {
+        if (perf->notif[i].phase == 0)
+            break;
+    }
+    if (i >= CK_NOTIF_SLOTS) {
+        LeaveCriticalSection(&perf->lock);
+        /* #region agent log */
+        dm_agent("H48", "dm_replace.c:notif", "notif-full", "{\"drop\":1}");
+        /* #endregion */
+        return;
+    }
+    s = &perf->notif[i];
+    memset(&s->msg, 0, sizeof(s->msg));
+    s->msg.dwSize = sizeof(s->msg);
+    s->msg.dwType = CK_DMUS_PMSGT_NOTIFICATION;
+    s->msg.guidNotificationType = CK_GUID_NOTIFICATION_SEGMENT;
+    s->msg.dwNotificationOption = CK_DMUS_NOTIFICATION_SEGEND;
+    s->msg.punkUser = st;
+    s->state = st;
+    st->refs++;
+    s->fire_ms = fire;
+    s->phase = 1;
+    LeaveCriticalSection(&perf->lock);
+
+    if (perf->notif_event)
+        SetEvent(perf->notif_event);
+
+    /* #region agent log */
+    {
+        char js[220];
+        BYTE *raw = (BYTE *)&s->msg;
+        snprintf(js, sizeof(js),
+                 "{\"slot\":%d,\"dur\":%lu,\"off_type\":%u,\"off_punk\":%u,\"off_guid\":%u,"
+                 "\"off_opt\":%u,\"raw_type\":%lu,\"raw_opt\":%lu,\"punk\":%lu}",
+                 i, (unsigned long)dur_ms,
+                 (unsigned)offsetof(CkNotifMsg, dwType),
+                 (unsigned)offsetof(CkNotifMsg, punkUser),
+                 (unsigned)offsetof(CkNotifMsg, guidNotificationType),
+                 (unsigned)offsetof(CkNotifMsg, dwNotificationOption),
+                 (unsigned long)*(DWORD *)(raw + 0x28),
+                 (unsigned long)*(DWORD *)(raw + 0x48),
+                 (unsigned long)(ULONG_PTR) * (void **)(raw + 0x34));
+        dm_agent("H51", "dm_replace.c:notif", "notif-sched", js);
+    }
+    /* #endregion */
+}
+
+static HRESULT STDMETHODCALLTYPE perf_GetNotificationPMsg(CkPerf *This, void **ppMsg)
+{
+    int i;
+    DWORD now;
+    CkNotifSlot *s;
+    HRESULT hr = S_FALSE;
+
+    if (!ppMsg)
+        return E_POINTER;
+    *ppMsg = NULL;
+    if (!This)
+        return E_POINTER;
+
+    now = GetTickCount();
+    EnterCriticalSection(&This->lock);
+    for (i = 0; i < CK_NOTIF_SLOTS; i++) {
+        s = &This->notif[i];
+        if (s->phase == 1 && (LONG)(now - s->fire_ms) >= 0) {
+            s->phase = 2;
+            *ppMsg = &s->msg;
+            hr = S_OK;
+            /* #region agent log */
+            {
+                char js[160];
+                snprintf(js, sizeof(js), "{\"slot\":%d,\"opt\":%lu,\"punk\":%lu}",
+                         i, (unsigned long)s->msg.dwNotificationOption,
+                         (unsigned long)(ULONG_PTR)s->msg.punkUser);
+                dm_agent("H50", "dm_replace.c:GetNotificationPMsg", "notif-get", js);
+            }
+            /* #endregion */
+            break;
+        }
+    }
+    LeaveCriticalSection(&This->lock);
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE perf_FreePMsg(CkPerf *This, void *pMsg)
+{
+    int i;
+
+    if (!This || !pMsg)
+        return E_POINTER;
+    EnterCriticalSection(&This->lock);
+    for (i = 0; i < CK_NOTIF_SLOTS; i++) {
+        CkNotifSlot *s = &This->notif[i];
+        if (&s->msg == pMsg && s->phase == 2) {
+            s->phase = 0;
+            if (s->state) {
+                InterlockedDecrement(&s->state->refs);
+                s->state = NULL;
+            }
+            s->msg.punkUser = NULL;
+            /* #region agent log */
+            {
+                char js[80];
+                snprintf(js, sizeof(js), "{\"slot\":%d}", i);
+                dm_agent("H48", "dm_replace.c:FreePMsg", "notif-free", js);
+            }
+            /* #endregion */
+            LeaveCriticalSection(&This->lock);
+            return S_OK;
+        }
+    }
+    LeaveCriticalSection(&This->lock);
+    return S_OK;
+}
+
+/* stdcall arity: N = stack args INCLUDING This (4 bytes each; __int64 = 2). */
+static HRESULT STDMETHODCALLTYPE stub_n1(void *This)
+{
+    (void)This;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE stub_n2(void *This, void *a)
+{
+    (void)This;
+    (void)a;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE stub_n3(void *This, void *a, void *b)
+{
+    (void)This;
+    (void)a;
+    (void)b;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE stub_n4(void *This, void *a, void *b, void *c)
+{
+    (void)This;
+    (void)a;
+    (void)b;
+    (void)c;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE stub_n5(void *This, void *a, void *b, void *c, void *d)
+{
+    (void)This;
+    (void)a;
+    (void)b;
+    (void)c;
+    (void)d;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE stub_n6(void *This, void *a, void *b, void *c, void *d, void *e)
+{
+    (void)This;
+    (void)a;
+    (void)b;
+    (void)c;
+    (void)d;
+    (void)e;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE stub_n7(void *This, void *a, void *b, void *c, void *d, void *e, void *f)
+{
+    (void)This;
+    (void)a;
+    (void)b;
+    (void)c;
+    (void)d;
+    (void)e;
+    (void)f;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE stub_n8(void *This, void *a, void *b, void *c, void *d, void *e, void *f,
+                                        void *g)
+{
+    (void)This;
+    (void)a;
+    (void)b;
+    (void)c;
+    (void)d;
+    (void)e;
+    (void)f;
+    (void)g;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE stub_n9(void *This, void *a, void *b, void *c, void *d, void *e, void *f,
+                                        void *g, void *h)
+{
+    (void)This;
+    (void)a;
+    (void)b;
+    (void)c;
+    (void)d;
+    (void)e;
+    (void)f;
+    (void)g;
+    (void)h;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE stub_n10(void *This, void *a, void *b, void *c, void *d, void *e, void *f,
+                                         void *g, void *h, void *i)
+{
+    (void)This;
+    (void)a;
+    (void)b;
+    (void)c;
+    (void)d;
+    (void)e;
+    (void)f;
+    (void)g;
+    (void)h;
+    (void)i;
+    return S_OK;
+}
+
+static void *stub_by_argc(int argc)
+{
+    switch (argc) {
+    case 1:
+        return (void *)stub_n1;
+    case 2:
+        return (void *)stub_n2;
+    case 3:
+        return (void *)stub_n3;
+    case 4:
+        return (void *)stub_n4;
+    case 5:
+        return (void *)stub_n5;
+    case 6:
+        return (void *)stub_n6;
+    case 7:
+        return (void *)stub_n7;
+    case 8:
+        return (void *)stub_n8;
+    case 9:
+        return (void *)stub_n9;
+    default:
+        return (void *)stub_n10;
+    }
+}
+
+/* Logged Segment stubs — identify which slot is hit after SetRepeats (crash hunt). */
+#define CK_SEG_STUB2(i)                                                               \
+    static HRESULT STDMETHODCALLTYPE seg_log2_##i(void *This, void *a)                \
+    {                                                                                 \
+        (void)This;                                                                   \
+        (void)a;                                                                      \
+        ck_ring_push(1, i);                                                           \
+        return S_OK;                                                                  \
+    }
+#define CK_SEG_STUB3(i)                                                               \
+    static HRESULT STDMETHODCALLTYPE seg_log3_##i(void *This, void *a, void *b)       \
+    {                                                                                 \
+        (void)This;                                                                   \
+        (void)a;                                                                      \
+        (void)b;                                                                      \
+        ck_ring_push(1, i);                                                           \
+        return S_OK;                                                                  \
+    }
+#define CK_SEG_STUB4(i)                                                               \
+    static HRESULT STDMETHODCALLTYPE seg_log4_##i(void *This, void *a, void *b, void *c) \
+    {                                                                                 \
+        (void)This;                                                                   \
+        (void)a;                                                                      \
+        (void)b;                                                                      \
+        (void)c;                                                                      \
+        ck_ring_push(1, i);                                                           \
+        return S_OK;                                                                  \
+    }
+#define CK_SEG_STUB5(i)                                                               \
+    static HRESULT STDMETHODCALLTYPE seg_log5_##i(void *This, void *a, void *b, void *c, \
+                                                  void *d)                            \
+    {                                                                                 \
+        (void)This;                                                                   \
+        (void)a;                                                                      \
+        (void)b;                                                                      \
+        (void)c;                                                                      \
+        (void)d;                                                                      \
+        ck_ring_push(1, i);                                                           \
+        return S_OK;                                                                  \
+    }
+#define CK_SEG_STUB6(i)                                                               \
+    static HRESULT STDMETHODCALLTYPE seg_log6_##i(void *This, void *a, void *b, void *c, \
+                                                  void *d, void *e)                   \
+    {                                                                                 \
+        (void)This;                                                                   \
+        (void)a;                                                                      \
+        (void)b;                                                                      \
+        (void)c;                                                                      \
+        (void)d;                                                                      \
+        (void)e;                                                                      \
+        ck_ring_push(1, i);                                                           \
+        return S_OK;                                                                  \
+    }
+#define CK_SEG_STUB7(i)                                                               \
+    static HRESULT STDMETHODCALLTYPE seg_log7_##i(void *This, void *a, void *b, void *c, \
+                                                  void *d, void *e, void *f)          \
+    {                                                                                 \
+        (void)This;                                                                   \
+        (void)a;                                                                      \
+        (void)b;                                                                      \
+        (void)c;                                                                      \
+        (void)d;                                                                      \
+        (void)e;                                                                      \
+        (void)f;                                                                      \
+        ck_ring_push(1, i);                                                           \
+        return S_OK;                                                                  \
+    }
+
+CK_SEG_STUB2(7)
+CK_SEG_STUB2(8)
+CK_SEG_STUB5(9)
+CK_SEG_STUB3(10)
+CK_SEG_STUB3(11)
+CK_SEG_STUB2(12)
+CK_SEG_STUB4(13)
+CK_SEG_STUB2(14)
+CK_SEG_STUB2(15)
+CK_SEG_STUB2(16)
+CK_SEG_STUB2(17)
+CK_SEG_STUB7(18)
+CK_SEG_STUB6(19)
+CK_SEG_STUB4(20)
+CK_SEG_STUB2(21)
+CK_SEG_STUB2(22)
+CK_SEG_STUB3(23)
+CK_SEG_STUB3(24)
+CK_SEG_STUB3(25)
+CK_SEG_STUB6(26)
+CK_SEG_STUB2(27)
+CK_SEG_STUB4(28)
+CK_SEG_STUB2(30)
+
+static const unsigned char g_perf_argc[PERF_VT] = {
+    3, 1, 1, 4, 6, 5, 3, 2, 2, 2, 2, 2, 3, 4, 3, 3, 3, 2, 2, 2, 4, 2, 2, 2, 2, 2, 4, 5, 5, 9,
+    3, 7, 6, 4, 4, 2, 2, 3, 1, 5, 6, 6, 7, 7, 8, 10, 5, 3, 4, 5, 2, 2, 8, 4, 4, 4,
+};
+
+/* stdcall arg counts including This — IDirectMusicSegment / Segment8 */
+static const unsigned char g_seg_argc[SEG_VT] = {
+    /* QI AddRef Release */
+    3, 1, 1,
+    /* Get/Set Length (2), GetRepeats GAME teardown 5-arg @20 (0x40cbb4), SetRepeats, DefaultResolution */
+    2, 2, 5, 2, 2, 2,
+    /* GetTrack(4), GetTrackGroup(2), InsertTrack(2), RemoveTrack(1) */
+    5, 3, 3, 2,
+    /* InitPlay(3), Get/SetGraph, Add/RemoveNotification */
+    4, 2, 2, 2, 2,
+    /* GetParam(6), SetParam(5), Clone(3) */
+    7, 6, 4,
+    /* Set/Get StartPoint, Set/Get LoopPoints, SetPChannelsUsed */
+    2, 2, 3, 3, 3,
+    /* Segment8: SetTrackConfig(5), GetAudioPathConfig(1), Compose(3), Download(1), Unload(1) */
+    6, 2, 4, 2, 2,
+};
+
+static HRESULT STDMETHODCALLTYPE stub_false_pmsg(void *This, void **pp)
+{
+    static volatile LONG s_n;
+    LONG n = InterlockedIncrement(&s_n);
+    if ((n % 50) == 1)
+        ck_ring_push(5, 21);
+    (void)This;
+    if (pp)
+        *pp = NULL;
+    return S_FALSE;
+}
+
+static HRESULT STDMETHODCALLTYPE stub_false_playing(void *This, void *a, void *b)
+{
+    (void)This;
+    (void)a;
+    (void)b;
+    return S_FALSE;
+}
+
+static HRESULT STDMETHODCALLTYPE perf_GetTime(void *This, LONGLONG *prt, LONG *pmt)
+{
+    (void)This;
+    if (prt)
+        *prt = 0;
+    if (pmt)
+        *pmt = 0;
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE perf_SetNotificationHandle(CkPerf *This, HANDLE h, LONGLONG rt)
+{
+    char js[128];
+    (void)rt;
+    if (This)
+        This->notif_event = h;
+    /* #region agent log */
+    snprintf(js, sizeof(js), "{\"h\":%lu,\"rt\":%lld}", (unsigned long)(ULONG_PTR)h, (long long)rt);
+    dm_agent("C1", "dm_replace.c:SetNotificationHandle", "set-notif-handle", js);
+    /* #endregion */
+    log_msg("dm-replace: SetNotificationHandle h=%p", h);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE perf_AddNotificationType(CkPerf *This, REFGUID g)
+{
+    if (This && g && IsEqualGUID(g, &CK_GUID_NOTIFICATION_SEGMENT))
+        This->notif_segment = 1;
+    /* #region agent log */
+    {
+        char js[80];
+        snprintf(js, sizeof(js), "{\"seg\":%d}", This && This->notif_segment ? 1 : 0);
+        dm_agent("C1", "dm_replace.c:AddNotificationType", "add-notif", js);
+    }
+    /* #endregion */
+    log_msg("dm-replace: AddNotificationType");
+    return S_OK;
+}
+
+/* -------- path (IDirectMusicAudioPath) -------- */
+static ULONG STDMETHODCALLTYPE path_AddRef(CkPath *This)
+{
+    return (ULONG)InterlockedIncrement(&This->refs);
+}
+static ULONG STDMETHODCALLTYPE path_Release(CkPath *This)
+{
+    LONG r = InterlockedDecrement(&This->refs);
+    if (r == 0) {
+        if (This->ctrl_proxy) {
+            CkDsCtrl *px = (CkDsCtrl *)This->ctrl_proxy;
+            This->ctrl_proxy = NULL;
+            px->path = NULL;
+            if (InterlockedDecrement(&px->refs) == 0)
+                free(px);
+        }
+        if (This->ctrl) {
+            IDirectSoundBuffer_Release(This->ctrl);
+            This->ctrl = NULL;
+        }
+        free(This);
+    }
+    return (ULONG)r;
+}
+static HRESULT STDMETHODCALLTYPE path_QI(CkPath *This, REFIID riid, void **ppv)
+{
+    (void)riid;
+    if (!ppv)
+        return E_POINTER;
+    *ppv = This;
+    path_AddRef(This);
+    return S_OK;
+}
+/* Game FUN_0040be40(this=path): call [*(path+4)->vtbl+0x14](self, vol, 0) = SetVolume@12. */
+static HRESULT STDMETHODCALLTYPE path_SetVolume(CkPath *This, LONG vol, DWORD dur)
+{
+    (void)dur;
+    if (!This)
+        return E_POINTER;
+    This->vol = vol;
+    path_propagate_volume(This);
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE path_Activate(CkPath *This, BOOL on)
+{
+    (void)This;
+    (void)on;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE path_ConvertPChannel(CkPath *This, DWORD in, DWORD *out)
+{
+    (void)This;
+    if (out)
+        *out = in;
+    return S_OK;
+}
+/*
+ * Game 0x40bbc0: GetObjectInPath(..., PATH_BUFFER, IID_IDirectSoundBuffer8) then SetPan.
+ * Returning primary made SetPan mute/bias the whole mix (H32: SFX heard once).
+ * Give each path a tiny CTRLVOLUME|CTRLPAN secondary + COM proxy so SetPan hits live SFX.
+ */
+enum { DSCTRL_VT = 20 };
+static void *g_dsctrl_vt[DSCTRL_VT];
+static int g_dsctrl_vt_ready;
+
+static HRESULT STDMETHODCALLTYPE dsc_QI(CkDsCtrl *This, REFIID riid, void **ppv)
+{
+    (void)riid;
+    if (!ppv)
+        return E_POINTER;
+    *ppv = This;
+    InterlockedIncrement(&This->refs);
+    return S_OK;
+}
+static ULONG STDMETHODCALLTYPE dsc_AddRef(CkDsCtrl *This)
+{
+    return (ULONG)InterlockedIncrement(&This->refs);
+}
+static ULONG STDMETHODCALLTYPE dsc_Release(CkDsCtrl *This)
+{
+    LONG r = InterlockedDecrement(&This->refs);
+    if (r == 0) {
+        /* Real buffer owned by CkPath — do not Release here. */
+        free(This);
+    }
+    return (ULONG)r;
+}
+static HRESULT STDMETHODCALLTYPE dsc_GetVolume(CkDsCtrl *This, LONG *vol)
+{
+    if (!This || !vol)
+        return E_POINTER;
+    *vol = This->path ? This->path->vol : 0;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE dsc_GetPan(CkDsCtrl *This, LONG *pan)
+{
+    if (!This || !pan)
+        return E_POINTER;
+    *pan = This->path ? This->path->pan : 0;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE dsc_SetVolume(CkDsCtrl *This, LONG vol)
+{
+    if (!This || !This->path)
+        return E_POINTER;
+    This->path->vol = vol;
+    path_propagate_volume(This->path);
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE dsc_SetPan(CkDsCtrl *This, LONG pan)
+{
+    if (!This || !This->path)
+        return E_POINTER;
+    This->path->pan = path_clamp_pan(pan);
+    path_propagate_pan(This->path);
+    beacon_update_pan(This->path->pan, This->path->id);
+    return S_OK;
+}
+
+static void init_dsctrl_vt(void)
+{
+    int i;
+    if (g_dsctrl_vt_ready)
+        return;
+    /* Default: stdcall This+1arg (GetCaps/etc). Unused paths should not be hit. */
+    for (i = 0; i < DSCTRL_VT; ++i)
+        g_dsctrl_vt[i] = stub_by_argc(2);
+    g_dsctrl_vt[0] = (void *)dsc_QI;
+    g_dsctrl_vt[1] = (void *)dsc_AddRef;
+    g_dsctrl_vt[2] = (void *)dsc_Release;
+    g_dsctrl_vt[6] = (void *)dsc_GetVolume;  /* 0x18 */
+    g_dsctrl_vt[7] = (void *)dsc_GetPan;     /* 0x1c */
+    g_dsctrl_vt[15] = (void *)dsc_SetVolume; /* 0x3c */
+    g_dsctrl_vt[16] = (void *)dsc_SetPan;    /* 0x40 — game 0x40bbc0 */
+    g_dsctrl_vt_ready = 1;
+}
+
+static CkDsCtrl *path_ensure_ctrl_proxy(CkPath *path)
+{
+    CkDsCtrl *px;
+    if (!path)
+        return NULL;
+    if (path->ctrl_proxy)
+        return (CkDsCtrl *)path->ctrl_proxy;
+    init_dsctrl_vt();
+    px = (CkDsCtrl *)calloc(1, sizeof(*px));
+    if (!px)
+        return NULL;
+    px->lpVtbl = g_dsctrl_vt;
+    px->refs = 1;
+    px->path = path;
+    px->real = path->ctrl;
+    path->ctrl_proxy = px;
+    return px;
+}
+
+static HRESULT STDMETHODCALLTYPE path_GetObjectInPath(CkPath *This, DWORD pch, DWORD stage, DWORD buf,
+                                                       REFGUID guidObj, DWORD index, REFGUID iid,
+                                                       void **ppObject)
+{
+    CkDsCtrl *px;
+    (void)pch;
+    (void)buf;
+    (void)guidObj;
+    (void)index;
+    (void)iid;
+    if (!ppObject)
+        return E_POINTER;
+    *ppObject = NULL;
+    if (!This || stage != 0x6000u || !g_active_perf || !g_active_perf->ds)
+        return E_FAIL;
+
+    if (!This->ctrl) {
+        DSBUFFERDESC desc;
+        WAVEFORMATEX wfx;
+        BYTE silence[256];
+        LPVOID p1 = NULL, p2 = NULL;
+        DWORD n1 = 0, n2 = 0;
+        HRESULT hr;
+
+        memset(&wfx, 0, sizeof(wfx));
+        wfx.wFormatTag = WAVE_FORMAT_PCM;
+        wfx.nChannels = 1;
+        wfx.nSamplesPerSec = 22050;
+        wfx.wBitsPerSample = 16;
+        wfx.nBlockAlign = 2;
+        wfx.nAvgBytesPerSec = 44100;
+        memset(&desc, 0, sizeof(desc));
+        desc.dwSize = sizeof(desc);
+        desc.dwFlags = DSBCAPS_LOCSOFTWARE | DSBCAPS_CTRLVOLUME | DSBCAPS_CTRLPAN | DSBCAPS_GLOBALFOCUS |
+                       DSBCAPS_STATIC;
+        desc.dwBufferBytes = sizeof(silence);
+        desc.lpwfxFormat = &wfx;
+        memset(silence, 0, sizeof(silence));
+        hr = IDirectSound_CreateSoundBuffer(g_active_perf->ds, &desc, &This->ctrl, NULL);
+        if (FAILED(hr) || !This->ctrl) {
+            This->ctrl = NULL;
+            return E_FAIL;
+        }
+        if (SUCCEEDED(IDirectSoundBuffer_Lock(This->ctrl, 0, sizeof(silence), &p1, &n1, &p2, &n2, 0))) {
+            if (p1 && n1)
+                memcpy(p1, silence, n1);
+            IDirectSoundBuffer_Unlock(This->ctrl, p1, n1, p2, n2);
+        }
+        if (This->vol)
+            IDirectSoundBuffer_SetVolume(This->ctrl, This->vol);
+        if (This->pan)
+            IDirectSoundBuffer_SetPan(This->ctrl, This->pan);
+    }
+
+    px = path_ensure_ctrl_proxy(This);
+    if (!px)
+        return E_OUTOFMEMORY;
+    dsc_AddRef(px);
+    *ppObject = px;
+    return S_OK;
+}
+
+/* -------- state (IDirectMusicSegmentState8) -------- */
+static void state_init(CkState *st, CkSegment *seg, DWORD repeats)
+{
+    if (!st)
+        return;
+    st->lpVtbl = g_state_vt;
+    st->refs = 1;
+    st->seg = seg;
+    st->repeats = repeats;
+}
+
+static ULONG STDMETHODCALLTYPE state_AddRef(CkState *This)
+{
+    return (ULONG)InterlockedIncrement(&This->refs);
+}
+static ULONG STDMETHODCALLTYPE state_Release(CkState *This)
+{
+    LONG r = InterlockedDecrement(&This->refs);
+    if (r == 0)
+        free(This);
+    return (ULONG)r;
+}
+static HRESULT STDMETHODCALLTYPE state_QI(CkState *This, REFIID riid, void **ppv)
+{
+    if (!ppv)
+        return E_POINTER;
+    if (!riid || IsEqualGUID(riid, &IID_IUnknown) ||
+        IsEqualGUID(riid, &IID_IDirectMusicSegmentState8)) {
+        *ppv = This;
+        state_AddRef(This);
+        /* #region agent log */
+        dm_agent("H49", "dm_replace.c:state_QI", "state-qi-ok",
+                 "{\"guid\":\"SegmentState8\"}");
+        /* #endregion */
+        return S_OK;
+    }
+    /* #region agent log */
+    {
+        char js[120];
+        snprintf(js, sizeof(js), "{\"d1\":%08lX}", (unsigned long)riid->Data1);
+        dm_agent("H49", "dm_replace.c:state_QI", "state-qi-fail", js);
+    }
+    /* #endregion */
+    *ppv = NULL;
+    return E_NOINTERFACE;
+}
+static HRESULT STDMETHODCALLTYPE state_GetRepeats(CkState *This, DWORD *repeats)
+{
+    if (!repeats)
+        return E_POINTER;
+    *repeats = This ? This->repeats : 0;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE state_GetSegment(CkState *This, void **segment)
+{
+    if (!segment)
+        return E_POINTER;
+    *segment = NULL;
+    if (!This || !This->seg)
+        return E_FAIL;
+    *segment = This->seg;
+    seg_AddRef(This->seg);
+    /* #region agent log */
+    {
+        char js[120];
+        snprintf(js, sizeof(js), "{\"seg\":%lu}", (unsigned long)(ULONG_PTR)This->seg);
+        dm_agent("H49", "dm_replace.c:GetSegment", "state-GetSegment", js);
+    }
+    /* #endregion */
+    return S_OK;
+}
+
+/* -------- segment -------- */
+static ULONG STDMETHODCALLTYPE seg_AddRef(CkSegment *This)
+{
+    return (ULONG)InterlockedIncrement(&This->refs);
+}
+static ULONG STDMETHODCALLTYPE seg_Release(CkSegment *This)
+{
+    LONG r = InterlockedDecrement(&This->refs);
+    /* #region agent log */
+    {
+        char js[120];
+        ck_ring_push(9, (int)r);
+        snprintf(js, sizeof(js), "{\"refs\":%ld,\"path\":\"%.60s\"}", (long)r, This->path);
+        dm_agent("H28", "dm_replace.c:Release", "seg-release", js);
+    }
+    /* #endregion */
+    /*
+     * Do not free — game touches segment after Release (crash-ctx: write AV @+8, ebp=seg,
+     * path music/Game10.ogg, refs→0). Native DM keeps objects alive longer.
+     */
+    if (r <= 0) {
+        This->refs = 1;
+        return 1;
+    }
+    return (ULONG)r;
+}
+static HRESULT STDMETHODCALLTYPE seg_QI(CkSegment *This, REFIID riid, void **ppv)
+{
+    ck_ring_push(4, 0);
+    /* #region agent log */
+    {
+        char js[160];
+        snprintf(js, sizeof(js),
+                 "{\"pcm\":%lu,\"guid\":\"%08lX-%04X-%04X\",\"ppv\":%lu}",
+                 (unsigned long)This->pcm_bytes,
+                 riid ? (unsigned long)riid->Data1 : 0UL, riid ? (unsigned)riid->Data2 : 0,
+                 riid ? (unsigned)riid->Data3 : 0, (unsigned long)(ULONG_PTR)ppv);
+        dm_agent("H3", "dm_replace.c:seg_QI", "seg-qi", js);
+    }
+    /* #endregion */
+    if (!ppv)
+        return E_POINTER;
+    if (IsEqualGUID(riid, &IID_IUnknown) || IsEqualGUID(riid, &IID_IDirectMusicSegment8)) {
+        *ppv = This;
+        seg_AddRef(This);
+        return S_OK;
+    }
+    *ppv = NULL;
+    return E_NOINTERFACE;
+}
+
+static HRESULT STDMETHODCALLTYPE seg_GetLength(CkSegment *This, LONG *pmt)
+{
+    ck_ring_push(7, 3);
+    /* #region agent log */
+    dm_agent("H2", "dm_replace.c:GetLength", "seg-GetLength",
+             "{\"idx\":3}");
+    /* #endregion */
+    if (pmt) {
+        if (This->fmt.nAvgBytesPerSec && This->pcm_bytes)
+            *pmt = (LONG)((This->pcm_bytes * 768u) / This->fmt.nAvgBytesPerSec);
+        else
+            *pmt = 1;
+        if (*pmt < 1)
+            *pmt = 1;
+    }
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE seg_SetLength(CkSegment *This, LONG mt)
+{
+    (void)This;
+    (void)mt;
+    /* #region agent log */
+    dm_agent("H2", "dm_replace.c:SetLength", "seg-SetLength", "{\"idx\":4}");
+    /* #endregion */
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE seg_SetRepeats(CkSegment *This, DWORD n)
+{
+    void *retaddr = __builtin_return_address(0);
+    /* #region agent log — H21: stack smash / bad ret; keep SetRepeats body minimal */
+    ck_ring_push(2, 6);
+    if (This)
+        This->repeats = n;
+    {
+        char js[260];
+        snprintf(js, sizeof(js),
+                 "{\"idx\":6,\"n\":%lu,\"n_signed\":%ld,\"refs\":%ld,\"path\":\"%.80s\"}",
+                 (unsigned long)n, (long)(LONG)n, (long)(This ? This->refs : -1),
+                 This ? This->path : "");
+        dm_agent("H47", "dm_replace.c:SetRepeats", "seg-SetRepeats", js);
+    }
+    ck_ring_push(2, -6);
+    {
+        char js[160];
+        snprintf(js, sizeof(js), "{\"ok\":1,\"ret\":%lu,\"esp_chk\":1}",
+                 (unsigned long)(ULONG_PTR)retaddr);
+        dm_agent("H21", "dm_replace.c:SetRepeats", "seg-SetRepeats-exit", js);
+    }
+    /* #endregion */
+    (void)retaddr;
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE seg_GetRepeats(CkSegment *This, DWORD a, DWORD b, DWORD c, DWORD d)
+{
+    /*
+     * Wine GetRepeats is (This, DWORD*) @8. Game teardown 0x40cbb4 pushes 5 dwords
+     * onto segment vtbl+0x14 → must be @20 or stack smash → heap AV (H31).
+     */
+    ck_ring_push(1, 5);
+    /* #region agent log */
+    {
+        char js[200];
+        snprintf(js, sizeof(js),
+                 "{\"slot\":5,\"a\":%lu,\"b\":%lu,\"c\":%lu,\"d\":%lu,\"refs\":%ld}",
+                 (unsigned long)a, (unsigned long)b, (unsigned long)c, (unsigned long)d,
+                 (long)(This ? This->refs : -1));
+        dm_agent("H31", "dm_replace.c:GetRepeats", "seg-GetRepeats5", js);
+    }
+    /* #endregion */
+    (void)This;
+    (void)b;
+    (void)c;
+    (void)d;
+    if (a > 0x10000u && !IsBadWritePtr((void *)(ULONG_PTR)a, sizeof(DWORD)))
+        *(DWORD *)(ULONG_PTR)a = 0;
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE seg_Download(CkSegment *This, void *pAudioPath)
+{
+    ck_ring_push(3, 29);
+    This->last_path = pAudioPath;
+    /* #region agent log */
+    {
+        char js[160];
+        snprintf(js, sizeof(js), "{\"seg\":%lu,\"path\":%lu,\"pcm\":%lu,\"refs\":%ld}",
+                 (unsigned long)(ULONG_PTR)This, (unsigned long)(ULONG_PTR)pAudioPath,
+                 (unsigned long)This->pcm_bytes, (long)This->refs);
+        dm_agent("R4", "dm_replace.c:Download", "seg-download", js);
+    }
+    /* #endregion */
+    log_msg("dm-replace: Download seg=%p pcm=%lu", (void *)This, (unsigned long)This->pcm_bytes);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE seg_Unload(CkSegment *This, void *pAudioPath)
+{
+    int is_music = This && path_is_music(This->path);
+
+    (void)pAudioPath;
+    /* H55: native Unload tears down the voice; we must Stop the DS buffer. */
+    stop_live_for_segment(This);
+    if (is_music) {
+        /* Only stop BGM — do not wipe s_live (playlist track change Unloads music). */
+        stop_music_buf();
+    }
+    (void)This;
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE seg_InitPlay(CkSegment *This, void **ppState, void *pPerf, DWORD flags)
+{
+    CkState *st;
+    (void)This;
+    (void)pPerf;
+    (void)flags;
+    if (!ppState)
+        return E_POINTER;
+    st = (CkState *)calloc(1, sizeof(*st));
+    if (!st)
+        return E_OUTOFMEMORY;
+    state_init(st, This, This ? (DWORD)This->repeats : 0);
+    *ppState = st;
+    /* #region agent log */
+    dm_agent("H34", "dm_replace.c:InitPlay", "seg-InitPlay", "{\"ok\":1}");
+    /* #endregion */
+    return S_OK;
+}
+
+/* -------- WAV / DS play -------- */
+static int parse_wav(const BYTE *data, DWORD size, WAVEFORMATEX *fmt, const BYTE **pcm, DWORD *pcm_len)
+{
+    DWORD pos;
+    if (!data || size < 12 || memcmp(data, "RIFF", 4) != 0 || memcmp(data + 8, "WAVE", 4) != 0)
+        return 0;
+    memset(fmt, 0, sizeof(*fmt));
+    *pcm = NULL;
+    *pcm_len = 0;
+    pos = 12;
+    while (pos + 8 <= size) {
+        DWORD cksz = *(const DWORD *)(data + pos + 4);
+        const BYTE *chunk = data + pos + 8;
+        if (pos + 8 + cksz > size)
+            break;
+        if (memcmp(data + pos, "fmt ", 4) == 0) {
+            if (cksz < 16)
+                return 0;
+            memcpy(fmt, chunk, cksz < sizeof(WAVEFORMATEX) ? cksz : sizeof(WAVEFORMATEX));
+            if (fmt->wFormatTag != WAVE_FORMAT_PCM)
+                return 0;
+        } else if (memcmp(data + pos, "data", 4) == 0) {
+            *pcm = chunk;
+            *pcm_len = cksz;
+        }
+        pos += 8 + cksz + (cksz & 1);
+    }
+    return (*pcm && *pcm_len && fmt->nChannels && fmt->nSamplesPerSec && fmt->wBitsPerSample) ? 1 : 0;
+}
+
+/* Tiny silent PCM (BGM is FMOD; DM path must not allocate ~44MB Game*.ogg). */
+static int make_silent_pcm(WAVEFORMATEX *fmt, BYTE **pcm_out, DWORD *pcm_len)
+{
+    DWORD nbytes = 2205u * 2u; /* ~100ms @ 22050 mono 16-bit */
+    BYTE *b = (BYTE *)calloc(1, nbytes);
+    if (!b)
+        return 0;
+    memset(fmt, 0, sizeof(*fmt));
+    fmt->wFormatTag = WAVE_FORMAT_PCM;
+    fmt->nChannels = 1;
+    fmt->nSamplesPerSec = 22050;
+    fmt->wBitsPerSample = 16;
+    fmt->nBlockAlign = 2;
+    fmt->nAvgBytesPerSec = 44100;
+    *pcm_out = b;
+    *pcm_len = nbytes;
+    return 1;
+}
+
+static int path_is_music(const char *path)
+{
+    char t[260];
+    size_t i;
+    if (!path)
+        return 0;
+    for (i = 0; path[i] && i + 1 < sizeof(t); ++i) {
+        char c = path[i];
+        if (c >= 'a' && c <= 'z')
+            c = (char)(c - 'a' + 'A');
+        if (c == '/')
+            c = '\\';
+        t[i] = c;
+    }
+    t[i] = '\0';
+    return strstr(t, "MUSIC\\") != NULL || strncmp(t, "MUSIC", 5) == 0;
+}
+
+/* Decode RIFF or Ogg into owned PCM buffer (*pcm_out must free). */
+static int decode_to_pcm(const BYTE *raw, DWORD raw_len, WAVEFORMATEX *fmt, BYTE **pcm_out,
+                         DWORD *pcm_len, int max_sec)
+{
+    const BYTE *p;
+    DWORD plen;
+    stb_vorbis *v;
+    stb_vorbis_info vi;
+    int err = 0, max_frames, buf_shorts, got;
+    short *samples = NULL;
+
+    *pcm_out = NULL;
+    *pcm_len = 0;
+    memset(fmt, 0, sizeof(*fmt));
+
+    if (raw_len >= 4 && memcmp(raw, "RIFF", 4) == 0) {
+        if (!parse_wav(raw, raw_len, fmt, &p, &plen))
+            return 0;
+        *pcm_out = (BYTE *)malloc(plen ? plen : 1);
+        if (!*pcm_out)
+            return 0;
+        memcpy(*pcm_out, p, plen);
+        *pcm_len = plen;
+        return 1;
+    }
+
+    if (raw_len < 4 || memcmp(raw, "OggS", 4) != 0)
+        return 0;
+
+    /* Music tracks are 3–8 min; OGG_DECODE_FULL must stay negative (0 was clamped to 1s). */
+    if (max_sec < 0) {
+        int ch = 0, sr = 0, frames;
+        short *out = NULL;
+
+        frames = stb_vorbis_decode_memory(raw, (int)raw_len, &ch, &sr, &out);
+        if (frames <= 0 || !out || ch < 1 || sr < 1) {
+            /* #region agent log */
+            {
+                char js[120];
+                snprintf(js, sizeof(js), "{\"frames\":%d,\"err\":%d}", frames, frames);
+                dm_agent("H44", "dm_replace.c:decode_to_pcm", "ogg-decode-full-fail", js);
+            }
+            /* #endregion */
+            free(out);
+            return 0;
+        }
+        fmt->wFormatTag = WAVE_FORMAT_PCM;
+        fmt->nChannels = (WORD)ch;
+        fmt->nSamplesPerSec = (DWORD)sr;
+        fmt->wBitsPerSample = 16;
+        fmt->nBlockAlign = (WORD)(ch * 2);
+        fmt->nAvgBytesPerSec = fmt->nSamplesPerSec * fmt->nBlockAlign;
+        *pcm_len = (DWORD)frames * (DWORD)ch * 2u;
+        *pcm_out = (BYTE *)out;
+        /* #region agent log */
+        {
+            char js[180];
+            snprintf(js, sizeof(js),
+                     "{\"got\":%d,\"pcm\":%lu,\"cap_sec\":0,\"dur_sec\":%.2f,\"ch\":%d,\"rate\":%u}",
+                     frames, (unsigned long)*pcm_len, (double)frames / (double)sr, ch, (unsigned)sr);
+            dm_agent("H44", "dm_replace.c:decode_to_pcm", "ogg-decode-full", js);
+        }
+        /* #endregion */
+        return 1;
+    }
+
+    if (max_sec < 1)
+        max_sec = 1;
+
+    v = stb_vorbis_open_memory(raw, (int)raw_len, &err, NULL);
+    if (!v)
+        return 0;
+    vi = stb_vorbis_get_info(v);
+    if (vi.channels < 1 || vi.sample_rate < 1) {
+        stb_vorbis_close(v);
+        return 0;
+    }
+    max_frames = (int)vi.sample_rate * max_sec;
+    if (max_frames < 1)
+        max_frames = 1;
+    buf_shorts = max_frames * vi.channels;
+    samples = (short *)malloc((size_t)buf_shorts * sizeof(short));
+    if (!samples) {
+        stb_vorbis_close(v);
+        return 0;
+    }
+    got = stb_vorbis_get_samples_short_interleaved(v, vi.channels, samples, buf_shorts);
+    stb_vorbis_close(v);
+    if (got <= 0) {
+        free(samples);
+        return 0;
+    }
+    fmt->wFormatTag = WAVE_FORMAT_PCM;
+    fmt->nChannels = (WORD)vi.channels;
+    fmt->nSamplesPerSec = (DWORD)vi.sample_rate;
+    fmt->wBitsPerSample = 16;
+    fmt->nBlockAlign = (WORD)(vi.channels * 2);
+    fmt->nAvgBytesPerSec = fmt->nSamplesPerSec * fmt->nBlockAlign;
+    *pcm_len = (DWORD)got * (DWORD)vi.channels * 2u;
+    *pcm_out = (BYTE *)samples;
+    /* #region agent log */
+    {
+        char js[140];
+        snprintf(js, sizeof(js), "{\"got\":%d,\"pcm\":%lu,\"cap_sec\":%d,\"ch\":%d,\"rate\":%u}", got,
+                 (unsigned long)*pcm_len, max_sec, vi.channels, (unsigned)vi.sample_rate);
+        dm_agent("H35", "dm_replace.c:decode_to_pcm", "ogg-decode", js);
+    }
+    /* #endregion */
+    return 1;
+}
+
+enum { PCM_CACHE_N = 64 };
+static struct {
+    char path[260];
+    BYTE *pcm;
+    DWORD pcm_bytes;
+    WAVEFORMATEX fmt;
+} g_pcm_cache[PCM_CACHE_N];
+static int g_pcm_cache_n;
+
+static int cache_get(const char *path, WAVEFORMATEX *fmt, BYTE **pcm, DWORD *pcm_bytes)
+{
+    int i;
+    for (i = 0; i < g_pcm_cache_n; ++i) {
+        if (lstrcmpiA(g_pcm_cache[i].path, path) == 0) {
+            *fmt = g_pcm_cache[i].fmt;
+            *pcm_bytes = g_pcm_cache[i].pcm_bytes;
+            *pcm = (BYTE *)malloc(*pcm_bytes);
+            if (!*pcm)
+                return 0;
+            memcpy(*pcm, g_pcm_cache[i].pcm, *pcm_bytes);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void cache_put(const char *path, const WAVEFORMATEX *fmt, const BYTE *pcm, DWORD pcm_bytes)
+{
+    int i;
+    if (!path || !pcm || !pcm_bytes)
+        return;
+    /* Do not cache multi‑MB music tracks (Game10 ~44MB PCM). */
+    if (pcm_bytes > 4u * 1024u * 1024u)
+        return;
+    for (i = 0; i < g_pcm_cache_n; ++i) {
+        if (lstrcmpiA(g_pcm_cache[i].path, path) == 0)
+            return;
+    }
+    if (g_pcm_cache_n >= PCM_CACHE_N)
+        return;
+    strncpy(g_pcm_cache[g_pcm_cache_n].path, path, sizeof(g_pcm_cache[0].path) - 1);
+    g_pcm_cache[g_pcm_cache_n].fmt = *fmt;
+    g_pcm_cache[g_pcm_cache_n].pcm_bytes = pcm_bytes;
+    g_pcm_cache[g_pcm_cache_n].pcm = (BYTE *)malloc(pcm_bytes);
+    if (!g_pcm_cache[g_pcm_cache_n].pcm)
+        return;
+    memcpy(g_pcm_cache[g_pcm_cache_n].pcm, pcm, pcm_bytes);
+    g_pcm_cache_n++;
+}
+
+static char g_game_dir[MAX_PATH];
+static int g_pak_loaded;
+
+enum { PAK_BUF_MAX = 8 };
+
+typedef struct {
+    char name[260];
+    DWORD off;
+    DWORD size;
+    BYTE *base; /* owning HMMSYS buffer (Sounds.pak / *_voices.pak) */
+} PakEntry;
+
+static BYTE *g_pak_bufs[PAK_BUF_MAX];
+static int g_pak_nbufs;
+static PakEntry *g_pak_ents;
+static int g_pak_nents;
+static int g_pak_cap;
+
+static void ensure_game_dir(void)
+{
+    char *slash;
+    if (g_game_dir[0])
+        return;
+    if (!GetModuleFileNameA(NULL, g_game_dir, MAX_PATH))
+        g_game_dir[0] = '\0';
+    slash = strrchr(g_game_dir, '\\');
+    if (!slash)
+        slash = strrchr(g_game_dir, '/');
+    if (slash)
+        slash[1] = '\0';
+}
+
+static void norm_pak_key(const char *in, char *out, size_t n)
+{
+    size_t i, j = 0;
+    for (i = 0; in[i] && j + 1 < n; ++i) {
+        char c = in[i];
+        if (c == '/')
+            c = '\\';
+        if (c >= 'a' && c <= 'z')
+            c = (char)(c - 'a' + 'A');
+        out[j++] = c;
+    }
+    out[j] = '\0';
+}
+
+/* assets/sounds/foo.wav or Sounds/foo.wav → SOUNDS\FOO.WAV (HMMSYS keys). */
+static void path_to_pak_key(const char *in, char *out, size_t n)
+{
+    char tmp[260];
+    const char *p;
+    norm_pak_key(in, tmp, sizeof(tmp));
+    p = tmp;
+    while (p[0] == '.' && p[1] == '\\')
+        p += 2;
+    if (strncmp(p, "ASSETS\\", 7) == 0)
+        p += 7;
+    strncpy(out, p, n - 1);
+    out[n - 1] = '\0';
+}
+
+/* Append one HMMSYS pack into the shared index (Sounds + Local voice paks). */
+static int append_hmmsys_pak(const char *path)
+{
+    HANDLE h;
+    DWORD rd = 0, pak_size;
+    BYTE *pak_data = NULL;
+    const BYTE *d;
+    DWORD num, pos, i;
+    char prev[260];
+    int added = 0;
+
+    if (g_pak_nbufs >= PAK_BUF_MAX)
+        return 0;
+
+    h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                    NULL);
+    if (h == INVALID_HANDLE_VALUE)
+        return 0;
+    pak_size = GetFileSize(h, NULL);
+    pak_data = (BYTE *)malloc(pak_size ? pak_size : 1);
+    if (!pak_data || !ReadFile(h, pak_data, pak_size, &rd, NULL) || rd != pak_size) {
+        CloseHandle(h);
+        free(pak_data);
+        return 0;
+    }
+    CloseHandle(h);
+    d = pak_data;
+    if (pak_size < 40 || memcmp(d, "HMMSYS PackFile\n", 16) != 0) {
+        free(pak_data);
+        return 0;
+    }
+    num = *(const DWORD *)(d + 32);
+    if (num > 200000) {
+        free(pak_data);
+        return 0;
+    }
+    if (g_pak_nents + (int)num > g_pak_cap) {
+        int ncap = g_pak_cap ? g_pak_cap * 2 : 512;
+        PakEntry *ne;
+        while (ncap < g_pak_nents + (int)num)
+            ncap *= 2;
+        ne = (PakEntry *)realloc(g_pak_ents, (size_t)ncap * sizeof(PakEntry));
+        if (!ne) {
+            free(pak_data);
+            return 0;
+        }
+        g_pak_ents = ne;
+        g_pak_cap = ncap;
+    }
+    pos = 40;
+    prev[0] = '\0';
+    for (i = 0; i < num && pos + 2 < pak_size; ++i) {
+        BYTE nlen = d[pos++];
+        BYTE reuse = d[pos++];
+        DWORD part = (DWORD)nlen - (DWORD)reuse;
+        char name[260];
+        DWORD off, size;
+        if (reuse > strlen(prev) || part + reuse >= sizeof(name) || pos + part + 8 > pak_size)
+            break;
+        memcpy(name, prev, reuse);
+        memcpy(name + reuse, d + pos, part);
+        name[reuse + part] = '\0';
+        pos += part;
+        off = *(const DWORD *)(d + pos);
+        size = *(const DWORD *)(d + pos + 4);
+        pos += 8;
+        if (off + size > pak_size)
+            continue;
+        memset(&g_pak_ents[g_pak_nents], 0, sizeof(g_pak_ents[0]));
+        strncpy(g_pak_ents[g_pak_nents].name, name, sizeof(g_pak_ents[0].name) - 1);
+        g_pak_ents[g_pak_nents].off = off;
+        g_pak_ents[g_pak_nents].size = size;
+        g_pak_ents[g_pak_nents].base = pak_data;
+        g_pak_nents++;
+        added++;
+        strncpy(prev, name, sizeof(prev) - 1);
+    }
+    if (added <= 0) {
+        free(pak_data);
+        return 0;
+    }
+    g_pak_bufs[g_pak_nbufs++] = pak_data;
+    log_msg("dm-replace: HMMSYS indexed %d entries from %s (total %d)", added, path, g_pak_nents);
+    /* #region agent log */
+    {
+        char js[360];
+        snprintf(js, sizeof(js),
+                 "{\"added\":%d,\"total\":%d,\"bufs\":%d,\"path\":\"%.200s\"}", added, g_pak_nents,
+                 g_pak_nbufs, path);
+        dm_agent("V1", "dm_replace.c:pak", "hmmsys-index", js);
+    }
+    /* #endregion */
+    return 1;
+}
+
+static int load_assets_pak_index(void)
+{
+    char path[MAX_PATH];
+    static const char *const candidates[] = {
+        "assets.pak",          /* Imperivm / CK unpacked tree */
+        "Packs\\Sounds.pak",   /* Imperivm 2 / tpw retail */
+        "Packs/Sounds.pak",
+    };
+    size_t i;
+    WIN32_FIND_DATAA fd;
+    HANDLE find;
+
+    if (g_pak_loaded)
+        return g_pak_nents > 0;
+    g_pak_loaded = 1;
+    ensure_game_dir();
+    for (i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+        snprintf(path, sizeof(path), "%s%s", g_game_dir, candidates[i]);
+        if (append_hmmsys_pak(path))
+            break;
+        log_msg("dm-replace: pak miss %s", path);
+    }
+    /* Unit voices live in Local/<Lang>_voices.pak (keys CURRENTLANG\VOICES\...). */
+    snprintf(path, sizeof(path), "%sLocal\\*_voices.pak", g_game_dir);
+    find = FindFirstFileA(path, &fd);
+    if (find == INVALID_HANDLE_VALUE) {
+        snprintf(path, sizeof(path), "%sLocal/*_voices.pak", g_game_dir);
+        find = FindFirstFileA(path, &fd);
+    }
+    if (find != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                continue;
+            snprintf(path, sizeof(path), "%sLocal\\%s", g_game_dir, fd.cFileName);
+            if (!append_hmmsys_pak(path))
+                log_msg("dm-replace: voice pak miss %s", path);
+        } while (FindNextFileA(find, &fd));
+        FindClose(find);
+    } else {
+        /* #region agent log */
+        dm_agent("V1", "dm_replace.c:pak", "voice-pak-miss", "{\"glob\":0}");
+        /* #endregion */
+        log_msg("dm-replace: no Local/*_voices.pak found");
+    }
+    return g_pak_nents > 0;
+}
+
+static int pak_find(const char *key, const BYTE **data, DWORD *len)
+{
+    char k[260], k2[260];
+    int i;
+    if (!load_assets_pak_index())
+        return 0;
+    path_to_pak_key(key, k, sizeof(k));
+    for (i = 0; i < g_pak_nents; ++i) {
+        if (strcmp(g_pak_ents[i].name, k) == 0) {
+            *data = g_pak_ents[i].base + g_pak_ents[i].off;
+            *len = g_pak_ents[i].size;
+            return 1;
+        }
+    }
+    /* also try with SOUNDS\ prefix if path was sounds\... already stripped assets */
+    if (strncmp(k, "SOUNDS\\", 7) != 0) {
+        snprintf(k2, sizeof(k2), "SOUNDS\\%s", k);
+        for (i = 0; i < g_pak_nents; ++i) {
+            if (strcmp(g_pak_ents[i].name, k2) == 0) {
+                *data = g_pak_ents[i].base + g_pak_ents[i].off;
+                *len = g_pak_ents[i].size;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int mem_readable(const void *p, size_t n)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    const BYTE *b = (const BYTE *)p;
+    size_t left = n;
+    if (!p || !n)
+        return 0;
+    while (left) {
+        SIZE_T chunk;
+        if (!VirtualQuery(b, &mbi, sizeof(mbi)))
+            return 0;
+        if (mbi.State != MEM_COMMIT)
+            return 0;
+        if (!(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                             PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+            return 0;
+        if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))
+            return 0;
+        chunk = (SIZE_T)(((BYTE *)mbi.BaseAddress + mbi.RegionSize) - b);
+        if (chunk > left)
+            chunk = left;
+        b += chunk;
+        left -= chunk;
+    }
+    return 1;
+}
+
+static int path_looks_audio(const char *s)
+{
+    size_t i, n;
+    int dot = 0;
+    if (!s || (unsigned char)s[0] < 32)
+        return 0;
+    n = 0;
+    while (n < 240 && s[n])
+        n++;
+    if (n < 5 || n >= 240)
+        return 0;
+    for (i = 0; i < n; ++i) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 32 || c > 126)
+            return 0;
+        if (c == '.')
+            dot = 1;
+    }
+    if (!dot)
+        return 0;
+    return (strstr(s, ".wav") || strstr(s, ".WAV") || strstr(s, ".ogg") || strstr(s, ".OGG") ||
+            strstr(s, "Sounds") || strstr(s, "SOUNDS") || strstr(s, "sounds"))
+               ? 1
+               : 0;
+}
+
+static int scrape_stream_path(void *stream, char *out, size_t outn)
+{
+    /* Game wav wrapper stores path at +8 (FUN_0040cfa0). Also probe a few nearby offsets. */
+    static const int offs[] = {8, 12, 16, 20, 24, 32, 64, 128, -1};
+    int i;
+    if (!stream || !out || outn < 8)
+        return 0;
+    if (!mem_readable(stream, 0x120))
+        return 0;
+    for (i = 0; offs[i] >= 0; ++i) {
+        const char *p = (const char *)stream + offs[i];
+        if (!mem_readable(p, 64))
+            continue;
+        if (path_looks_audio(p)) {
+            size_t j;
+            for (j = 0; j + 1 < outn && p[j] && (unsigned char)p[j] >= 32; ++j)
+                out[j] = p[j];
+            out[j] = '\0';
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static HRESULT load_wav_file_or_pak(const char *path, BYTE **out, DWORD *out_len)
+{
+    char key[260], disk[MAX_PATH], unpacked[MAX_PATH];
+    const BYTE *pdata;
+    DWORD plen;
+    HANDLE h;
+    DWORD sz, rd;
+    BYTE *buf;
+
+    *out = NULL;
+    *out_len = 0;
+    if (!path || !path[0])
+        return E_FAIL;
+
+    ensure_game_dir();
+
+    /* 1) assets_unpacked — try raw + pak-style key */
+    path_to_pak_key(path, key, sizeof(key));
+    snprintf(unpacked, sizeof(unpacked), "%sassets_unpacked\\%s", g_game_dir, key);
+    h = CreateFileA(unpacked, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        snprintf(unpacked, sizeof(unpacked), "%s%s", g_game_dir, path);
+        {
+            char *p;
+            for (p = unpacked; *p; ++p)
+                if (*p == '/')
+                    *p = '\\';
+        }
+        h = CreateFileA(unpacked, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    }
+    if (h != INVALID_HANDLE_VALUE) {
+        sz = GetFileSize(h, NULL);
+        buf = (BYTE *)malloc(sz ? sz : 1);
+        if (buf && ReadFile(h, buf, sz, &rd, NULL) && rd == sz) {
+            CloseHandle(h);
+            *out = buf;
+            *out_len = sz;
+            return S_OK;
+        }
+        free(buf);
+        CloseHandle(h);
+    }
+
+    /* 2) assets.pak */
+    if (pak_find(path, &pdata, &plen)) {
+        buf = (BYTE *)malloc(plen);
+        if (!buf)
+            return E_OUTOFMEMORY;
+        memcpy(buf, pdata, plen);
+        *out = buf;
+        *out_len = plen;
+        return S_OK;
+    }
+
+    /* 3) raw under game dir (music ogg files) */
+    snprintf(disk, sizeof(disk), "%s%s", g_game_dir, path);
+    {
+        char *p;
+        for (p = disk; *p; ++p)
+            if (*p == '/')
+                *p = '\\';
+    }
+    h = CreateFileA(disk, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+        return E_FAIL;
+    sz = GetFileSize(h, NULL);
+    buf = (BYTE *)malloc(sz ? sz : 1);
+    if (!buf || !ReadFile(h, buf, sz, &rd, NULL) || rd != sz) {
+        free(buf);
+        CloseHandle(h);
+        return E_FAIL;
+    }
+    CloseHandle(h);
+    *out = buf;
+    *out_len = sz;
+    return S_OK;
+}
+
+static HRESULT read_istream_all(void *stream, BYTE **out, DWORD *out_len)
+{
+    (void)stream;
+    *out = NULL;
+    *out_len = 0;
+    return E_NOTIMPL; /* game stream is not stdcall IStream — never call it */
+}
+
+static HRESULT load_audio_from_stream(void *stream, BYTE **out, DWORD *out_len, char *path_out,
+                                      size_t path_n)
+{
+    HRESULT hr;
+    char spath[260];
+
+    path_out[0] = '\0';
+    *out = NULL;
+    *out_len = 0;
+
+    if (!scrape_stream_path(stream, spath, sizeof(spath))) {
+        dm_agent("R2b", "dm_replace.c:load", "no-path", "{\"fail\":1}");
+        return E_FAIL;
+    }
+    strncpy(path_out, spath, path_n - 1);
+    path_out[path_n - 1] = '\0';
+    hr = load_wav_file_or_pak(spath, out, out_len);
+    if (SUCCEEDED(hr)) {
+        static volatile LONG s_load_log;
+        LONG ln = InterlockedIncrement(&s_load_log);
+        if (ln <= 30 || (ln % 50) == 0) {
+            char js[300];
+            snprintf(js, sizeof(js), "{\"hr\":0,\"path\":\"%.180s\",\"len\":%lu,\"n\":%ld}", spath,
+                     (unsigned long)(*out_len), (long)ln);
+            dm_agent("R2b", "dm_replace.c:load", "path-load", js);
+            log_msg("dm-replace: loaded '%s' (%lu bytes)", spath, (unsigned long)*out_len);
+        }
+    } else {
+        char js[300];
+        snprintf(js, sizeof(js), "{\"hr\":%ld,\"path\":\"%.180s\"}", (long)hr, spath);
+        dm_agent("R2b", "dm_replace.c:load", "path-load-fail", js);
+    }
+    return hr;
+}
+
+static HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
+{
+    DSBUFFERDESC desc;
+    LPDIRECTSOUNDBUFFER buf = NULL;
+    LPVOID p1 = NULL, p2 = NULL;
+    DWORD n1 = 0, n2 = 0;
+    HRESULT hr;
+    char js[320];
+    DWORD play_bytes;
+    DWORD dur_ms;
+    DWORD now;
+    int i;
+    int is_music;
+    int loop_play;
+    LONG pvol;
+
+    if (!perf || !perf->ds || !seg || !seg->pcm || !seg->pcm_bytes)
+        return E_FAIL;
+
+    if (!apath && seg->last_path)
+        apath = (CkPath *)seg->last_path;
+
+    /* flags=0 → default/music path; flags=0x80 → secondary SFX channel (DIRECTMUSIC.md) */
+    is_music = !(flags & 0x80u) && path_is_music(seg->path);
+    /* H-M1: do not force-loop all music — only SetRepeats(-1). */
+    loop_play = seg->repeats == (DWORD)-1;
+    pvol = apath ? apath->vol : 0;
+    if (!is_music && apath && apath->id)
+        path_stop_live_sfx(apath->id);
+    now = GetTickCount();
+    /* H36: Wine GetStatus lies on STATIC buffers → free only by done_tick + margin */
+    for (i = 0; i < s_live_n;) {
+        if ((LONG)(now - s_live[i].done_tick) >= 0) {
+            /* #region agent log */
+            dm_agent("H29", "dm_replace.c:play_pcm", "ds-buf-free", "{\"n\":1}");
+            /* #endregion */
+            live_free_slot(i);
+        } else
+            i++;
+    }
+
+    play_bytes = seg->pcm_bytes;
+    dur_ms = seg->fmt.nAvgBytesPerSec
+                 ? (DWORD)((ULONGLONG)play_bytes * 1000ull / seg->fmt.nAvgBytesPerSec)
+                 : 1000u;
+    if (dur_ms < 50u)
+        dur_ms = 50u;
+    if (!is_music)
+        dur_ms += 400u; /* sfx tail margin — do not recycle early (H36) */
+
+    /* Opt-in looping Hastatus test only (CK_AUDIO_BEACON=1). */
+    if (!is_music && path_is_rhastatus(seg->path) && beacon_want()) {
+        beacon_start_from_seg(perf, seg, apath);
+        return (g_beacon_L && g_beacon_R) ? S_OK : E_FAIL;
+    }
+
+    /* Voices/buildings: one-shot spatial. Ambient may loop (birds/waves beds). */
+    if (!is_music && path_want_spatial(seg->path) &&
+        (!loop_play || path_is_ambient_sfx(seg->path))) {
+        int amb = path_is_ambient_sfx(seg->path);
+        int spat_ok = spatial_voice_play(perf, seg, apath, loop_play && amb);
+        if (spat_ok)
+            return S_OK;
+    }
+
+    {
+        WAVEFORMATEX play_wfx = seg->fmt;
+        BYTE *render = NULL;
+        DWORD render_bytes = play_bytes;
+        LONG ppan = (!is_music && apath) ? apath->pan : 0;
+        int use_softpan = !is_music && seg->fmt.wBitsPerSample == 16 &&
+                          (seg->fmt.nChannels == 1 || seg->fmt.nChannels == 2);
+
+        memset(&desc, 0, sizeof(desc));
+        desc.dwSize = sizeof(desc);
+        desc.dwFlags = DSBCAPS_LOCSOFTWARE | DSBCAPS_CTRLVOLUME | DSBCAPS_GLOBALFOCUS |
+                       DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_STATIC;
+        if (use_softpan) {
+            stereo_wfx_from(&seg->fmt, &play_wfx);
+            if (seg->fmt.nChannels == 1)
+                render_bytes = (seg->pcm_bytes / 2u) * 4u;
+            else
+                render_bytes = seg->pcm_bytes;
+            render = (BYTE *)malloc(render_bytes);
+            if (!render)
+                return E_OUTOFMEMORY;
+            if (pcm_render_panned_stereo(seg->pcm, &seg->fmt, seg->pcm_bytes, render, render_bytes,
+                                         ppan) != render_bytes) {
+                free(render);
+                return E_FAIL;
+            }
+            desc.dwBufferBytes = render_bytes;
+            desc.lpwfxFormat = &play_wfx;
+            play_bytes = render_bytes;
+        } else {
+            desc.dwFlags |= DSBCAPS_CTRLPAN;
+            desc.dwBufferBytes = play_bytes;
+            desc.lpwfxFormat = &seg->fmt;
+        }
+
+        /* #region agent log */
+        snprintf(js, sizeof(js),
+                 "{\"pre\":1,\"want\":%lu,\"play\":%lu,\"rate\":%u,\"live\":%d,\"music\":%d,\"hold\":%d,"
+                 "\"path_id\":%lu,\"vol\":%ld,\"pan\":%ld,\"softpan\":%d,\"flags\":0x%lX,\"loop\":%d}",
+                 (unsigned long)seg->pcm_bytes, (unsigned long)play_bytes,
+                 (unsigned)seg->fmt.nSamplesPerSec, s_live_n, is_music, perf->music_buf ? 1 : 0,
+                 (unsigned long)(apath ? apath->id : 0), (long)pvol, (long)ppan, use_softpan ? 1 : 0,
+                 (unsigned long)flags, loop_play ? 1 : 0);
+        dm_agent("H38", "dm_replace.c:play_pcm", "ds-play-pre", js);
+        /* #endregion */
+
+        EnterCriticalSection(&perf->lock);
+        hr = IDirectSound_CreateSoundBuffer(perf->ds, &desc, &buf, NULL);
+        if (SUCCEEDED(hr)) {
+            if (render) {
+                if (!ds_buf_write_all(buf, render, render_bytes))
+                    hr = E_FAIL;
+            } else {
+                hr = IDirectSoundBuffer_Lock(buf, 0, play_bytes, &p1, &n1, &p2, &n2, 0);
+                if (SUCCEEDED(hr)) {
+                    memcpy(p1, seg->pcm, n1);
+                    if (p2 && n2)
+                        memcpy(p2, seg->pcm + n1, n2);
+                    IDirectSoundBuffer_Unlock(buf, p1, n1, p2, n2);
+                }
+            }
+            if (SUCCEEDED(hr)) {
+                DWORD play_flags = loop_play ? DSBPLAY_LOOPING : 0;
+                hr = IDirectSoundBuffer_Play(buf, 0, 0, play_flags);
+                if (SUCCEEDED(hr)) {
+                    path_apply_buf_vol(buf, pvol);
+                    if (!use_softpan && !is_music && apath)
+                        path_apply_buf_pan(buf, apath->pan);
+                }
+            }
+        }
+        LeaveCriticalSection(&perf->lock);
+        free(render);
+    }
+
+    if (SUCCEEDED(hr) && buf) {
+        if (is_music) {
+            if (perf->music_buf) {
+                IDirectSoundBuffer_Stop(perf->music_buf);
+                IDirectSoundBuffer_Release(perf->music_buf);
+            }
+            perf->music_buf = buf;
+            buf = NULL;
+        } else if (s_live_n < (int)(sizeof(s_live) / sizeof(s_live[0]))) {
+            memset(&s_live[s_live_n], 0, sizeof(s_live[0]));
+            s_live[s_live_n].b = buf;
+            s_live[s_live_n].bR = NULL;
+            s_live[s_live_n].done_tick =
+                loop_play ? (GetTickCount() + 3600000u) : (GetTickCount() + dur_ms);
+            s_live[s_live_n].path_id = apath ? apath->id : 0;
+            s_live[s_live_n].seg = seg;
+            s_live[s_live_n].spatial = 0;
+            s_live_n++;
+            buf = NULL;
+        } else {
+            /* #region agent log */
+            dm_agent("H29", "dm_replace.c:play_pcm", "ds-buf-drop", "{\"full\":1}");
+            /* #endregion */
+            IDirectSoundBuffer_Release(buf);
+            buf = NULL;
+        }
+    } else if (buf) {
+        IDirectSoundBuffer_Release(buf);
+        buf = NULL;
+    }
+
+    /* #region agent log */
+    snprintf(js, sizeof(js),
+             "{\"hr\":%ld,\"bytes\":%lu,\"play\":%lu,\"rate\":%u,\"ch\":%u,\"live\":%d,\"music\":%d,"
+             "\"dur\":%lu,\"path_id\":%lu,\"vol\":%ld,\"flags\":0x%lX}",
+             (long)hr, (unsigned long)seg->pcm_bytes, (unsigned long)play_bytes,
+             (unsigned)seg->fmt.nSamplesPerSec, (unsigned)seg->fmt.nChannels, s_live_n, is_music,
+             (unsigned long)dur_ms, (unsigned long)(apath ? apath->id : 0), (long)pvol,
+             (unsigned long)flags);
+    dm_agent("H38", "dm_replace.c:play_pcm", "ds-play", js);
+    /* #endregion */
+    return hr;
+}
+
+/* -------- performance -------- */
+static ULONG STDMETHODCALLTYPE perf_AddRef(CkPerf *This)
+{
+    return (ULONG)InterlockedIncrement(&This->refs);
+}
+static ULONG STDMETHODCALLTYPE perf_Release(CkPerf *This)
+{
+    LONG r = InterlockedDecrement(&This->refs);
+    if (r == 0) {
+        beacon_stop();
+        if (This->music_buf) {
+            IDirectSoundBuffer_Stop(This->music_buf);
+            IDirectSoundBuffer_Release(This->music_buf);
+            This->music_buf = NULL;
+        }
+        if (This->primary)
+            IDirectSoundBuffer_Release(This->primary);
+        if (This->ds)
+            IDirectSound_Release(This->ds);
+        DeleteCriticalSection(&This->lock);
+        free(This);
+    }
+    return (ULONG)r;
+}
+static HRESULT STDMETHODCALLTYPE perf_QI(CkPerf *This, REFIID riid, void **ppv)
+{
+    if (!ppv)
+        return E_POINTER;
+    if (!riid || IsEqualGUID(riid, &IID_IUnknown) || IsEqualGUID(riid, &IID_IDirectMusicPerformance8)) {
+        *ppv = This;
+        perf_AddRef(This);
+        return S_OK;
+    }
+    *ppv = NULL;
+    return E_NOINTERFACE;
+}
+
+static HRESULT STDMETHODCALLTYPE perf_InitAudio(CkPerf *This, void **ppDM, void **ppDS, HWND hwnd,
+                                                DWORD pathType, DWORD pchannels, DWORD flags,
+                                                void *params)
+{
+    HRESULT hr;
+    DSBUFFERDESC desc;
+    WAVEFORMATEX wfx;
+    char js[256];
+
+    (void)ppDM;
+    (void)pathType;
+    (void)pchannels;
+    (void)params;
+    This->hwnd = hwnd ? hwnd : GetForegroundWindow();
+
+    hr = DirectSoundCreate(NULL, &This->ds, NULL);
+    if (FAILED(hr)) {
+        log_msg("dm-replace: DirectSoundCreate hr=0x%08lx", (unsigned long)hr);
+        dm_agent("R1", "dm_replace.c:InitAudio", "init-fail", "{\"step\":\"dsc\"}");
+        return hr;
+    }
+    hr = IDirectSound_SetCooperativeLevel(This->ds, This->hwnd ? This->hwnd : GetDesktopWindow(),
+                                          DSSCL_PRIORITY);
+    if (FAILED(hr))
+        hr = IDirectSound_SetCooperativeLevel(This->ds, GetDesktopWindow(), DSSCL_NORMAL);
+
+    memset(&wfx, 0, sizeof(wfx));
+    wfx.wFormatTag = WAVE_FORMAT_PCM;
+    wfx.nChannels = 2;
+    wfx.nSamplesPerSec = 44100;
+    wfx.wBitsPerSample = 16;
+    wfx.nBlockAlign = 4;
+    wfx.nAvgBytesPerSec = 44100 * 4;
+
+    memset(&desc, 0, sizeof(desc));
+    desc.dwSize = sizeof(desc);
+    desc.dwFlags = DSBCAPS_PRIMARYBUFFER;
+    hr = IDirectSound_CreateSoundBuffer(This->ds, &desc, &This->primary, NULL);
+    if (SUCCEEDED(hr))
+        IDirectSoundBuffer_SetFormat(This->primary, &wfx);
+
+    if (ppDS)
+        *ppDS = NULL;
+
+    g_active_perf = This;
+
+    /* #region agent log */
+    snprintf(js, sizeof(js),
+             "{\"hr\":%ld,\"flags\":\"0x%lX\",\"hwnd\":%lu,\"ds\":%lu}", (long)hr, (unsigned long)flags,
+             (unsigned long)(ULONG_PTR)This->hwnd, (unsigned long)(ULONG_PTR)This->ds);
+    dm_agent("R1", "dm_replace.c:InitAudio", "init-audio", js);
+    /* #endregion */
+    log_msg("dm-replace: InitAudio hr=0x%08lx flags=0x%lx ds=%p", (unsigned long)hr,
+            (unsigned long)flags, (void *)This->ds);
+    return SUCCEEDED(hr) ? S_OK : hr;
+}
+
+static HRESULT STDMETHODCALLTYPE perf_CreateStdPath(CkPerf *This, DWORD type, DWORD pchannels,
+                                                    DWORD flags, void **ppPath)
+{
+    CkPath *p;
+    char js[160];
+    (void)This;
+    (void)flags;
+    if (!ppPath)
+        return E_POINTER;
+    p = (CkPath *)calloc(1, sizeof(*p));
+    if (!p)
+        return E_OUTOFMEMORY;
+    p->lpVtbl = g_path_vt;
+    p->self = p; /* Download wrapper reads *(path+4) */
+    p->refs = 1;
+    p->id = (DWORD)InterlockedIncrement((LONG *)&g_path_id);
+    *ppPath = p;
+    snprintf(js, sizeof(js), "{\"type\":%lu,\"pch\":%lu,\"id\":%lu,\"path\":%lu}", (unsigned long)type,
+             (unsigned long)pchannels, (unsigned long)p->id, (unsigned long)(ULONG_PTR)p);
+    dm_agent("R3", "dm_replace.c:CreateStdPath", "audio-path", js);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE perf_PlaySegmentEx(CkPerf *This, void *source, WCHAR *name,
+                                                    void *transition, DWORD flags, LONGLONG start,
+                                                    void **ppState, void *from, void *audiopath);
+
+static HRESULT STDMETHODCALLTYPE perf_PlaySegment(CkPerf *This, void *source, DWORD flags, LONGLONG start,
+                                                  void **ppState)
+{
+    /* #region agent log */
+    {
+        CkSegment *seg = (CkSegment *)source;
+        char js[160];
+        snprintf(js, sizeof(js), "{\"pcm\":%lu,\"flags\":0x%lX,\"seg\":%lu}",
+                 (unsigned long)(seg ? seg->pcm_bytes : 0), (unsigned long)flags,
+                 (unsigned long)(ULONG_PTR)source);
+        dm_agent("H9", "dm_replace.c:PlaySegment", "play-seg-old", js);
+    }
+    /* #endregion */
+    return perf_PlaySegmentEx(This, source, NULL, NULL, flags, start, ppState, NULL, NULL);
+}
+
+static HRESULT STDMETHODCALLTYPE perf_PlaySegmentEx(CkPerf *This, void *source, WCHAR *name,
+                                                    void *transition, DWORD flags, LONGLONG start,
+                                                    void **ppState, void *from, void *audiopath)
+{
+    CkSegment *seg = (CkSegment *)source;
+    HRESULT hr;
+    LONG n = InterlockedIncrement(&g_play_n);
+    CkState *st = NULL;
+    char js[280];
+    CkPath *path = (CkPath *)(audiopath ? audiopath : from);
+
+    (void)name;
+    (void)transition;
+    (void)start;
+
+    ck_ring_push(6, 45);
+
+    if (!seg || !seg->pcm)
+        return E_INVALIDARG;
+    if (!seg->last_path && path)
+        seg->last_path = path;
+    if (!path && seg->last_path)
+        path = (CkPath *)seg->last_path;
+
+    /* #region agent log */
+    {
+        char js0[240];
+        snprintf(js0, sizeof(js0),
+                 "{\"n\":%ld,\"pcm\":%lu,\"flags\":0x%lX,\"refs\":%ld,\"path_id\":%lu,\"vol\":%ld,"
+                 "\"repeats\":%ld,\"path\":\"%.80s\"}",
+                 (long)n, (unsigned long)seg->pcm_bytes, (unsigned long)flags, (long)seg->refs,
+                 (unsigned long)(path ? path->id : 0), (long)(path ? path->vol : 0),
+                 (long)(LONG)seg->repeats, seg->path);
+        dm_agent("H40", "dm_replace.c:PlaySegmentEx", "play-enter", js0);
+    }
+    /* #endregion */
+
+    hr = play_pcm(This, seg, path, flags);
+
+    if (ppState) {
+        st = (CkState *)calloc(1, sizeof(*st));
+        if (st) {
+            state_init(st, seg, (DWORD)(LONG)seg->repeats);
+            *ppState = st;
+        } else
+            *ppState = NULL;
+    }
+
+    if (SUCCEEDED(hr) && st) {
+        int music = !(flags & 0x80u) && path_is_music(seg->path);
+        int loop = seg->repeats == (DWORD)-1;
+        /* Non-loop music needs SEGEND so the game can advance the playlist. */
+        if (!music || !loop) {
+            DWORD dur = seg->fmt.nAvgBytesPerSec
+                            ? (DWORD)((ULONGLONG)seg->pcm_bytes * 1000ull / seg->fmt.nAvgBytesPerSec)
+                            : 1000u;
+            notif_schedule_segend(This, st, dur);
+        }
+    }
+
+    snprintf(js, sizeof(js),
+             "{\"n\":%ld,\"hr\":%ld,\"flags\":0x%lX,\"pcm\":%lu,\"path_id\":%lu,\"vol\":%ld}",
+             (long)n, (long)hr, (unsigned long)flags, (unsigned long)seg->pcm_bytes,
+             (unsigned long)(path ? path->id : 0), (long)(path ? path->vol : 0));
+    dm_agent("H40", "dm_replace.c:PlaySegmentEx", "play-seg", js);
+    if (n <= 40 || (n % 25) == 0)
+        log_msg("dm-replace: PlaySegmentEx #%ld hr=0x%08lx pcm=%lu", (long)n, (unsigned long)hr,
+                (unsigned long)seg->pcm_bytes);
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE perf_Stop(CkPerf *This, void *seg, void *state, DWORD mt, DWORD flags)
+{
+    (void)This;
+    (void)mt;
+    (void)flags;
+    /* Native Stop(NULL,NULL) stops all; we only hold BGM in music_buf. */
+    if (!seg && !state)
+        stop_music_buf();
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE perf_StopEx(CkPerf *This, void *obj, ULONGLONG when, DWORD flags)
+{
+    (void)This;
+    (void)when;
+    (void)flags;
+    if (!obj)
+        stop_music_buf();
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE perf_CloseDown(CkPerf *This)
+{
+    stop_all_live_sfx();
+    if (This->music_buf) {
+        IDirectSoundBuffer_Stop(This->music_buf);
+        IDirectSoundBuffer_Release(This->music_buf);
+        This->music_buf = NULL;
+    }
+    if (This->primary) {
+        IDirectSoundBuffer_Release(This->primary);
+        This->primary = NULL;
+    }
+    if (This->ds) {
+        IDirectSound_Release(This->ds);
+        This->ds = NULL;
+    }
+    if (g_active_perf == This)
+        g_active_perf = NULL;
+    return S_OK;
+}
+
+/* -------- loader -------- */
+static ULONG STDMETHODCALLTYPE ldr_AddRef(CkLoader *This)
+{
+    return (ULONG)InterlockedIncrement(&This->refs);
+}
+static ULONG STDMETHODCALLTYPE ldr_Release(CkLoader *This)
+{
+    LONG r = InterlockedDecrement(&This->refs);
+    if (r == 0)
+        free(This);
+    return (ULONG)r;
+}
+static HRESULT STDMETHODCALLTYPE ldr_QI(CkLoader *This, REFIID riid, void **ppv)
+{
+    if (!ppv)
+        return E_POINTER;
+    if (!riid || IsEqualGUID(riid, &IID_IUnknown) || IsEqualGUID(riid, &IID_IDirectMusicLoader8)) {
+        *ppv = This;
+        ldr_AddRef(This);
+        return S_OK;
+    }
+    /* Accept any — game may pass IID_Loader without 8 */
+    *ppv = This;
+    ldr_AddRef(This);
+    return S_OK;
+}
+
+/* IDirectMusicLoader::ReleaseObject — drop the QI ref ba50 acquired (H52). */
+static HRESULT STDMETHODCALLTYPE ldr_ReleaseObject(CkLoader *This, void *pObject)
+{
+    (void)This;
+    /* #region agent log */
+    {
+        char js[80];
+        snprintf(js, sizeof(js), "{\"obj\":%lu}", (unsigned long)(ULONG_PTR)pObject);
+        dm_agent("H52", "dm_replace.c:ReleaseObject", "ldr-ReleaseObject", js);
+    }
+    /* #endregion */
+    if (pObject)
+        ((ULONG(STDMETHODCALLTYPE *)(void *))(*(void ***)pObject)[2])(pObject);
+    return S_OK;
+}
+
+/* Game ba50: loader vtbl+0x34 (slot 13), 2 stack args — must ret@8 (H52). */
+static HRESULT STDMETHODCALLTYPE ldr_slot13(CkLoader *This, void *a)
+{
+    (void)This;
+    /* #region agent log */
+    {
+        char js[80];
+        snprintf(js, sizeof(js), "{\"a\":%lu}", (unsigned long)(ULONG_PTR)a);
+        dm_agent("H52", "dm_replace.c:ldr_slot13", "ldr-slot13", js);
+    }
+    /* #endregion */
+    if (a)
+        ((ULONG(STDMETHODCALLTYPE *)(void *))(*(void ***)a)[2])(a);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE ldr_GetObject(CkLoader *This, void *pDesc, REFIID riid, void **ppv)
+{
+    DWORD *pd;
+    DWORD valid = 0;
+    void *stream = NULL;
+    BYTE *raw = NULL;
+    DWORD raw_len = 0;
+    BYTE *pcm_buf = NULL;
+    DWORD pcm_len = 0;
+    WAVEFORMATEX fmt;
+    CkSegment *seg;
+    HRESULT hr;
+    LONG n = InterlockedIncrement(&g_get_n);
+    char js[280];
+    char scraped[260];
+
+    (void)This;
+    (void)riid;
+    if (!pDesc || !ppv)
+        return E_POINTER;
+    *ppv = NULL;
+
+    pd = (DWORD *)pDesc;
+    valid = pd[1];
+    if (!(valid & DMUS_OBJ_STREAM)) {
+        dm_agent("R2", "dm_replace.c:GetObject", "get-not-stream", "{\"valid\":0}");
+        return E_FAIL;
+    }
+
+    if (pd[0] >= 0x350)
+        stream = *(void **)((BYTE *)pDesc + 0x34C);
+    if (!stream && pd[0] >= 8)
+        stream = *(void **)((BYTE *)pDesc + pd[0] - sizeof(void *));
+
+    if (!stream) {
+        dm_agent("R2", "dm_replace.c:GetObject", "get-no-stream-ptr", "{\"fail\":1}");
+        return E_FAIL;
+    }
+
+    scraped[0] = '\0';
+    if (!scrape_stream_path(stream, scraped, sizeof(scraped))) {
+        dm_agent("R2b", "dm_replace.c:GetObject", "no-path", "{\"fail\":1}");
+        return E_FAIL;
+    }
+
+    /* Music: decode capped OGG (silence stub → inaudible BGM, H30). Same path as SFX. */
+    if (cache_get(scraped, &fmt, &pcm_buf, &pcm_len)) {
+        /* ok */
+    } else {
+        hr = load_wav_file_or_pak(scraped, &raw, &raw_len);
+        if (FAILED(hr) || !raw) {
+            if (n <= 8 || (n % 40) == 0) {
+                snprintf(js, sizeof(js), "{\"n\":%ld,\"hr\":%ld,\"path\":\"%.120s\"}", (long)n, (long)hr,
+                         scraped);
+                dm_agent("R2", "dm_replace.c:GetObject", "get-load-fail", js);
+            }
+            free(raw);
+            return FAILED(hr) ? hr : E_FAIL;
+        }
+        if (!decode_to_pcm(raw, raw_len, &fmt, &pcm_buf, &pcm_len,
+                           path_is_music(scraped) ? OGG_DECODE_FULL : OGG_DECODE_MAX_SEC)) {
+            snprintf(js, sizeof(js), "{\"n\":%ld,\"path\":\"%.120s\",\"raw\":%lu}", (long)n, scraped,
+                     (unsigned long)raw_len);
+            dm_agent("R2", "dm_replace.c:GetObject", "get-bad-decode", js);
+            if (n <= 8)
+                log_msg("dm-replace: decode fail '%s' len=%lu", scraped, (unsigned long)raw_len);
+            free(raw);
+            return E_FAIL;
+        }
+        free(raw);
+        raw = NULL;
+        cache_put(scraped, &fmt, pcm_buf, pcm_len);
+        if (n <= 30 || (n % 50) == 0 || path_is_music(scraped)) {
+            snprintf(js, sizeof(js),
+                     "{\"n\":%ld,\"path\":\"%.100s\",\"pcm\":%lu,\"rate\":%u,\"ch\":%u,\"music\":%d}",
+                     (long)n, scraped, (unsigned long)pcm_len, (unsigned)fmt.nSamplesPerSec,
+                     (unsigned)fmt.nChannels, path_is_music(scraped) ? 1 : 0);
+            dm_agent("H30", "dm_replace.c:GetObject", "decoded", js);
+            log_msg("dm-replace: decoded '%s' pcm=%lu %uHz %uch", scraped, (unsigned long)pcm_len,
+                    (unsigned)fmt.nSamplesPerSec, (unsigned)fmt.nChannels);
+        }
+    }
+
+    seg = (CkSegment *)calloc(1, sizeof(*seg));
+    if (!seg) {
+        free(pcm_buf);
+        return E_OUTOFMEMORY;
+    }
+    seg->lpVtbl = g_seg_vt;
+    seg->refs = 1;
+    seg->fmt = fmt;
+    seg->pcm_bytes = pcm_len;
+    seg->pcm = pcm_buf;
+    strncpy(seg->path, scraped, sizeof(seg->path) - 1);
+    *ppv = seg;
+
+    /* #region agent log */
+    {
+        char js2[200];
+        snprintf(js2, sizeof(js2),
+                 "{\"sizeof\":%lu,\"off_refs\":%lu,\"off_pcm\":%lu,\"path\":\"%.80s\",\"pcm\":%lu}",
+                 (unsigned long)sizeof(CkSegment), (unsigned long)offsetof(CkSegment, refs),
+                 (unsigned long)offsetof(CkSegment, pcm), scraped, (unsigned long)pcm_len);
+        dm_agent("R5", "dm_replace.c:GetObject", "seg-layout", js2);
+    }
+    /* #endregion */
+
+    /* Always log successes — sparse logging hid BIRDS5 before crash. */
+    snprintf(js, sizeof(js),
+             "{\"n\":%ld,\"hr\":0,\"pcm\":%lu,\"rate\":%u,\"ch\":%u,\"path\":\"%.120s\"}", (long)n,
+             (unsigned long)pcm_len, (unsigned)fmt.nSamplesPerSec, (unsigned)fmt.nChannels, scraped);
+    dm_agent("R2", "dm_replace.c:GetObject", "get-object", js);
+    return S_OK;
+}
+
+static void init_vtables(void)
+{
+    int i;
+    if (g_vt_ready)
+        return;
+
+    for (i = 0; i < PERF_VT; ++i)
+        g_perf_vt[i] = stub_by_argc(g_perf_argc[i] ? g_perf_argc[i] : 4);
+
+    g_perf_vt[0] = (void *)perf_QI;
+    g_perf_vt[1] = (void *)perf_AddRef;
+    g_perf_vt[2] = (void *)perf_Release;
+    g_perf_vt[4] = (void *)perf_PlaySegment; /* classic PlaySegment */
+    g_perf_vt[PERF_IDX_STOP] = (void *)perf_Stop;
+    g_perf_vt[14] = (void *)stub_false_playing; /* IsPlaying */
+    g_perf_vt[15] = (void *)perf_GetTime;
+    g_perf_vt[PERF_IDX_SETNOTIF] = (void *)perf_SetNotificationHandle;
+    g_perf_vt[PERF_IDX_GETNOTIF] = (void *)perf_GetNotificationPMsg;
+    g_perf_vt[PERF_IDX_FREEPMSG] = (void *)perf_FreePMsg;
+    g_perf_vt[PERF_IDX_ADDNOTIF] = (void *)perf_AddNotificationType;
+    g_perf_vt[PERF_IDX_CLOSEDOWN] = (void *)perf_CloseDown;
+    g_perf_vt[PERF_IDX_INITAUDIO] = (void *)perf_InitAudio;
+    g_perf_vt[PERF_IDX_PLAYSEGEX] = (void *)perf_PlaySegmentEx;
+    g_perf_vt[PERF_IDX_STOPEX] = (void *)perf_StopEx;
+    g_perf_vt[PERF_IDX_CREATESTD] = (void *)perf_CreateStdPath;
+
+    for (i = 0; i < LDR_VT; ++i)
+        g_ldr_vt[i] = stub_by_argc(2); /* default ret@8 — never stub_n4 (H52 stack smash) */
+    g_ldr_vt[0] = (void *)ldr_QI;
+    g_ldr_vt[1] = (void *)ldr_AddRef;
+    g_ldr_vt[2] = (void *)ldr_Release;
+    g_ldr_vt[LDR_IDX_GETOBJECT] = (void *)ldr_GetObject;
+    g_ldr_vt[LDR_IDX_SETOBJECT] = stub_by_argc(2);
+    g_ldr_vt[LDR_IDX_SETSEARCH] = stub_by_argc(4);
+    g_ldr_vt[LDR_IDX_SCANDIR] = stub_by_argc(4);
+    g_ldr_vt[LDR_IDX_CACHEOBJ] = stub_by_argc(2);
+    g_ldr_vt[LDR_IDX_RELEASEOBJ] = (void *)ldr_ReleaseObject;
+    g_ldr_vt[LDR_IDX_CLEARCACHE] = stub_by_argc(2);
+    g_ldr_vt[LDR_IDX_ENABLECACHE] = stub_by_argc(3);
+    g_ldr_vt[LDR_IDX_COLLECTGARBAGE] = stub_by_argc(1);
+    g_ldr_vt[13] = (void *)ldr_slot13; /* ba50 +0x34 */
+
+    for (i = 0; i < SEG_VT; ++i)
+        g_seg_vt[i] = stub_by_argc(g_seg_argc[i] ? g_seg_argc[i] : 2);
+    g_seg_vt[0] = (void *)seg_QI;
+    g_seg_vt[1] = (void *)seg_AddRef;
+    g_seg_vt[2] = (void *)seg_Release;
+    g_seg_vt[3] = (void *)seg_GetLength;
+    g_seg_vt[4] = (void *)seg_SetLength;
+    g_seg_vt[5] = (void *)seg_GetRepeats;
+    g_seg_vt[6] = (void *)seg_SetRepeats;
+    g_seg_vt[7] = (void *)seg_log2_7;
+    g_seg_vt[8] = (void *)seg_log2_8;
+    g_seg_vt[9] = (void *)seg_log5_9;
+    g_seg_vt[10] = (void *)seg_log3_10;
+    g_seg_vt[11] = (void *)seg_log3_11;
+    g_seg_vt[12] = (void *)seg_log2_12;
+    g_seg_vt[13] = (void *)seg_log4_13;
+    g_seg_vt[14] = (void *)seg_log2_14;
+    g_seg_vt[15] = (void *)seg_log2_15;
+    g_seg_vt[16] = (void *)seg_InitPlay;
+    g_seg_vt[17] = (void *)seg_log2_17;
+    g_seg_vt[18] = (void *)seg_log7_18;
+    g_seg_vt[19] = (void *)seg_log6_19;
+    g_seg_vt[20] = (void *)seg_log4_20;
+    g_seg_vt[21] = (void *)seg_log2_21;
+    g_seg_vt[22] = (void *)seg_log2_22;
+    g_seg_vt[23] = (void *)seg_log3_23;
+    g_seg_vt[24] = (void *)seg_log3_24;
+    g_seg_vt[25] = (void *)seg_log3_25;
+    g_seg_vt[26] = (void *)seg_log6_26;
+    g_seg_vt[27] = (void *)seg_log2_27;
+    g_seg_vt[28] = (void *)seg_log4_28;
+    g_seg_vt[SEG_IDX_DOWNLOAD] = (void *)seg_Download;
+    g_seg_vt[SEG_IDX_UNLOAD] = (void *)seg_Unload;
+
+    /* IDirectMusicAudioPath argc incl. This; slot5 SetVolume must be @12 (see H26). */
+    {
+        static const unsigned char path_argc[PATH_VT] = {3, 1, 1, 8, 2, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2};
+        for (i = 0; i < PATH_VT; ++i)
+            g_path_vt[i] = stub_by_argc(path_argc[i]);
+    }
+    g_path_vt[0] = (void *)path_QI;
+    g_path_vt[1] = (void *)path_AddRef;
+    g_path_vt[2] = (void *)path_Release;
+    g_path_vt[3] = (void *)path_GetObjectInPath;
+    g_path_vt[4] = (void *)path_Activate;
+    g_path_vt[5] = (void *)path_SetVolume;
+    g_path_vt[6] = (void *)path_ConvertPChannel;
+
+    for (i = 0; i < STATE_VT; ++i)
+        g_state_vt[i] = stub_by_argc(2); /* GetStartTime/Seek/etc are 2-arg */
+    g_state_vt[0] = (void *)state_QI;
+    g_state_vt[1] = (void *)state_AddRef;
+    g_state_vt[2] = (void *)state_Release;
+    g_state_vt[3] = (void *)state_GetRepeats;
+    g_state_vt[4] = (void *)state_GetSegment;
+
+    g_vt_ready = 1;
+    (void)CLSID_DMSegment;
+}
+
+void dm_replace_install(void)
+{
+    char envbuf[32];
+    DWORD nenv = GetEnvironmentVariableA("CK_DM_REPLACE", envbuf, (DWORD)sizeof(envbuf));
+    const char *e = NULL;
+    /*
+     * Default OFF. Runtime+RE (Celtic_Kings ds8.cpp): our COM stub crashes after the first
+     * Segment::SetRepeats (AV execute @ 0xFFFFFE0C / SEH). Game already ships DX dmusic DLLs;
+     * dm_native redirects CoCreate/LoadLibrary there. Set CK_DM_REPLACE=1 only to test the stub.
+     * Prefer Win32 GetEnvironmentVariableA — Wine often does not expose Unix env to CRT getenv.
+     */
+    if (nenv > 0 && nenv < sizeof(envbuf))
+        e = envbuf;
+    else
+        e = getenv("CK_DM_REPLACE");
+    g_enabled = (e && (e[0] == '1') && e[1] == '\0');
+    if (!g_live_cs_ok) {
+        InitializeCriticalSection(&g_live_cs);
+        InterlockedExchange(&g_live_cs_ok, 1);
+    }
+    /* #region agent log — VEH always: crash capture even when stub off (H70/H71) */
+    AddVectoredExceptionHandler(1, ck_veh);
+    {
+        char js[160];
+        snprintf(js, sizeof(js), "{\"enabled\":%d,\"env\":\"%.32s\"}", g_enabled,
+                 e ? e : "(null)");
+        dm_agent("H71", "dm_replace.c:install", g_enabled ? "dm-replace-ready" : "dm-replace-disabled",
+                 js);
+    }
+    /* #endregion */
+    if (!g_enabled) {
+        log_msg("dm-replace: disabled (default) — using dm_native / game dmusic DLLs; "
+                "CK_DM_REPLACE=1 to force stub");
+        return;
+    }
+    init_vtables();
+    install_onscreen_pan_fix();
+    log_msg("dm-replace: ENABLED — CoCreate Loader/Performance → stub + DirectSound");
+}
+
+int dm_replace_enabled(void)
+{
+    return g_enabled;
+}
+
+HRESULT dm_replace_cocreate(REFCLSID clsid, REFIID iid, void **ppv)
+{
+    if (!g_enabled || !clsid || !ppv)
+        return E_FAIL;
+    *ppv = NULL;
+    init_vtables();
+
+    if (IsEqualGUID(clsid, &CLSID_DMPerformance)) {
+        CkPerf *p = (CkPerf *)calloc(1, sizeof(*p));
+        if (!p)
+            return E_OUTOFMEMORY;
+        p->lpVtbl = g_perf_vt;
+        p->refs = 1;
+        InitializeCriticalSection(&p->lock);
+        *ppv = p;
+        (void)iid;
+        dm_agent("R0", "dm_replace.c:cocreate", "cocreate-perf", "{\"ok\":1}");
+        log_msg("dm-replace: CoCreate Performance stub %p", (void *)p);
+        return S_OK;
+    }
+    if (IsEqualGUID(clsid, &CLSID_DMLoader)) {
+        CkLoader *l = (CkLoader *)calloc(1, sizeof(*l));
+        if (!l)
+            return E_OUTOFMEMORY;
+        l->lpVtbl = g_ldr_vt;
+        l->refs = 1;
+        *ppv = l;
+        (void)iid;
+        dm_agent("R0", "dm_replace.c:cocreate", "cocreate-loader", "{\"ok\":1}");
+        log_msg("dm-replace: CoCreate Loader stub %p", (void *)l);
+        return S_OK;
+    }
+    return E_FAIL;
+}
