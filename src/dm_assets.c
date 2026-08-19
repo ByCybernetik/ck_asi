@@ -17,11 +17,7 @@ typedef struct {
 extern stb_vorbis *stb_vorbis_open_memory(const unsigned char *data, int len, int *error,
                                          const stb_vorbis_alloc *alloc);
 extern stb_vorbis_info stb_vorbis_get_info(stb_vorbis *f);
-extern int stb_vorbis_get_samples_short_interleaved(stb_vorbis *f, int channels, short *buffer,
-                                                    int num_shorts);
-extern int stb_vorbis_decode_memory(const unsigned char *mem, int len, int *channels,
-                                    int *sample_rate, short **output);
-extern int stb_vorbis_get_frame_short_interleaved(stb_vorbis *f, int num_c, short *buffer, int num_shorts);
+extern int stb_vorbis_get_frame_float(stb_vorbis *f, int *channels, float ***output);
 extern void stb_vorbis_close(stb_vorbis *f);
 
 static int parse_wav(const BYTE *data, DWORD size, WAVEFORMATEX *fmt, const BYTE **pcm, DWORD *pcm_len)
@@ -53,6 +49,47 @@ static int parse_wav(const BYTE *data, DWORD size, WAVEFORMATEX *fmt, const BYTE
     return (*pcm && *pcm_len && fmt->nChannels && fmt->nSamplesPerSec && fmt->wBitsPerSample) ? 1 : 0;
 }
 
+static short pcm_float_to_s16(float v)
+{
+    if (v > 1.0f) v = 1.0f;
+    if (v < -1.0f) v = -1.0f;
+    return (short)(v * 32767.0f);
+}
+
+static void dm_downmix_frame_to_s16(float **src, int src_ch, int frames, short *dst)
+{
+    int i;
+    if (!dst || frames <= 0)
+        return;
+    for (i = 0; i < frames; ++i) {
+        float l = 0.0f, r = 0.0f;
+        if (src_ch <= 0 || !src) {
+            dst[i * 2 + 0] = 0;
+            dst[i * 2 + 1] = 0;
+            continue;
+        }
+        if (src_ch == 1) {
+            float m = src[0] ? src[0][i] : 0.0f;
+            l = m;
+            r = m;
+        } else {
+            l = src[0] ? src[0][i] : 0.0f;
+            r = src[1] ? src[1][i] : 0.0f;
+            if (src_ch >= 3 && src[2]) {
+                float c = src[2][i] * 0.5f;
+                l += c;
+                r += c;
+            }
+            if (src_ch >= 4 && src[3])
+                l += src[3][i] * 0.5f;
+            if (src_ch >= 5 && src[4])
+                r += src[4][i] * 0.5f;
+        }
+        dst[i * 2 + 0] = pcm_float_to_s16(l);
+        dst[i * 2 + 1] = pcm_float_to_s16(r);
+    }
+}
+
 /* Decode RIFF or Ogg into owned PCM buffer (*pcm_out must free). */
 int decode_to_pcm(const BYTE *raw, DWORD raw_len, WAVEFORMATEX *fmt, BYTE **pcm_out,
                          DWORD *pcm_len, int max_sec)
@@ -61,8 +98,7 @@ int decode_to_pcm(const BYTE *raw, DWORD raw_len, WAVEFORMATEX *fmt, BYTE **pcm_
     DWORD plen;
     stb_vorbis *v;
     stb_vorbis_info vi;
-    int err = 0, max_frames, buf_shorts, got;
-    short *samples = NULL;
+    int err = 0, max_frames, got;
 
     *pcm_out = NULL;
     *pcm_len = 0;
@@ -82,75 +118,6 @@ int decode_to_pcm(const BYTE *raw, DWORD raw_len, WAVEFORMATEX *fmt, BYTE **pcm_
     if (raw_len < 4 || memcmp(raw, "OggS", 4) != 0)
         return 0;
 
-    /* Music tracks are 3–8 min; OGG_DECODE_FULL must stay negative (0 was clamped to 1s). */
-    if (max_sec < 0) {
-        /*
-         * stb_vorbis_decode_memory uses v->channels internally for
-         * stb_vorbis_get_frame_short_interleaved.  Some game OGGs report
-         * 6-8 channels, causing stb_vorbis internal OOM (NULL channel_buffers)
-         * → crash.  Decode manually with stereo downmix instead.
-         */
-        stb_vorbis *vf;
-        stb_vorbis_info vfi;
-        int limit_f, total_s, offset_s = 0, data_len = 0, err2 = 0;
-        short *out = NULL;
-        const int out_ch = 2;
-
-        vf = stb_vorbis_open_memory(raw, (int)raw_len, &err2, NULL);
-        if (!vf) {
-            dm_agent("H44", "dm_replace.c:decode_to_pcm", "ogg-decode-full-fail", "{\"err\":1}");
-            return 0;
-        }
-        vfi = stb_vorbis_get_info(vf);
-        if (vfi.channels < 1 || vfi.sample_rate < 1) {
-            stb_vorbis_close(vf);
-            return 0;
-        }
-        limit_f = 4096;
-        total_s = limit_f * out_ch;
-        out = (short *)malloc((size_t)total_s * sizeof(short));
-        if (!out) { stb_vorbis_close(vf); return 0; }
-        for (;;) {
-            int n = stb_vorbis_get_frame_short_interleaved(vf, out_ch,
-                        out + offset_s, total_s - offset_s);
-            if (n == 0) break;
-            data_len += n;
-            offset_s += n * out_ch;
-            if (offset_s + limit_f * out_ch > total_s) {
-                short *nb;
-                total_s *= 2;
-                nb = (short *)realloc(out, (size_t)total_s * sizeof(short));
-                if (!nb) { free(out); stb_vorbis_close(vf); return 0; }
-                out = nb;
-            }
-        }
-        stb_vorbis_close(vf);
-        if (data_len <= 0 || !out) { free(out); return 0; }
-        fmt->wFormatTag = WAVE_FORMAT_PCM;
-        fmt->nChannels = (WORD)out_ch;
-        fmt->nSamplesPerSec = (DWORD)vfi.sample_rate;
-        fmt->wBitsPerSample = 16;
-        fmt->nBlockAlign = (WORD)(out_ch * 2);
-        fmt->nAvgBytesPerSec = fmt->nSamplesPerSec * fmt->nBlockAlign;
-        *pcm_len = (DWORD)data_len * (DWORD)out_ch * 2u;
-        *pcm_out = (BYTE *)out;
-        /* #region agent log */
-        {
-            char js[180];
-            snprintf(js, sizeof(js),
-                     "{\"got\":%d,\"pcm\":%lu,\"cap_sec\":0,\"dur_sec\":%.2f,\"ch\":%d,\"rate\":%u}",
-                     data_len, (unsigned long)*pcm_len,
-                     (double)data_len / (double)vfi.sample_rate,
-                     out_ch, (unsigned)vfi.sample_rate);
-            dm_agent("H44", "dm_replace.c:decode_to_pcm", "ogg-decode-full", js);
-        }
-        /* #endregion */
-        return 1;
-    }
-
-    if (max_sec < 1)
-        max_sec = 1;
-
     v = stb_vorbis_open_memory(raw, (int)raw_len, &err, NULL);
     if (!v)
         return 0;
@@ -159,23 +126,84 @@ int decode_to_pcm(const BYTE *raw, DWORD raw_len, WAVEFORMATEX *fmt, BYTE **pcm_
         stb_vorbis_close(v);
         return 0;
     }
-    max_frames = (int)vi.sample_rate * max_sec;
-    if (max_frames < 1)
-        max_frames = 1;
+
     {
+        short *samples = NULL;
         const int out_ch = 2;
-        buf_shorts = max_frames * out_ch;
-        samples = (short *)malloc((size_t)buf_shorts * sizeof(short));
-        if (!samples) {
-            stb_vorbis_close(v);
-            return 0;
+        got = 0;
+
+        if (max_sec < 0) {
+            int total_shorts = 4096 * out_ch;
+            int offset = 0;
+            samples = (short *)malloc((size_t)total_shorts * sizeof(short));
+            if (!samples) {
+                stb_vorbis_close(v);
+                return 0;
+            }
+            for (;;) {
+                int n, ch = 0, tries;
+                float **outs = NULL;
+                n = 0;
+                for (tries = 0; tries < 8; ++tries) {
+                    n = stb_vorbis_get_frame_float(v, &ch, &outs);
+                    if (n > 0)
+                        break;
+                }
+                if (n <= 0)
+                    break;
+                if (offset + n * out_ch > total_shorts) {
+                    short *nb;
+                    total_shorts *= 2;
+                    nb = (short *)realloc(samples, (size_t)total_shorts * sizeof(short));
+                    if (!nb) {
+                        free(samples);
+                        stb_vorbis_close(v);
+                        return 0;
+                    }
+                    samples = nb;
+                }
+                dm_downmix_frame_to_s16(outs, ch, n, samples + offset);
+                offset += n * out_ch;
+                got += n;
+            }
+        } else {
+            int remaining;
+            if (max_sec < 1)
+                max_sec = 1;
+            max_frames = (int)vi.sample_rate * max_sec;
+            if (max_frames < 1)
+                max_frames = 1;
+            remaining = max_frames;
+            samples = (short *)malloc((size_t)max_frames * out_ch * sizeof(short));
+            if (!samples) {
+                stb_vorbis_close(v);
+                return 0;
+            }
+            while (remaining > 0) {
+                int n, ch = 0, tries;
+                float **outs = NULL;
+                n = 0;
+                for (tries = 0; tries < 8; ++tries) {
+                    n = stb_vorbis_get_frame_float(v, &ch, &outs);
+                    if (n > 0)
+                        break;
+                }
+                if (n <= 0)
+                    break;
+                if (n > remaining)
+                    n = remaining;
+                dm_downmix_frame_to_s16(outs, ch, n, samples + got * out_ch);
+                got += n;
+                remaining -= n;
+            }
         }
-        got = stb_vorbis_get_samples_short_interleaved(v, out_ch, samples, buf_shorts);
+
         stb_vorbis_close(v);
-        if (got <= 0) {
+        if (got <= 0 || !samples) {
             free(samples);
             return 0;
         }
+
         fmt->wFormatTag = WAVE_FORMAT_PCM;
         fmt->nChannels = (WORD)out_ch;
         fmt->nSamplesPerSec = (DWORD)vi.sample_rate;
@@ -183,17 +211,19 @@ int decode_to_pcm(const BYTE *raw, DWORD raw_len, WAVEFORMATEX *fmt, BYTE **pcm_
         fmt->nBlockAlign = (WORD)(out_ch * 2);
         fmt->nAvgBytesPerSec = fmt->nSamplesPerSec * fmt->nBlockAlign;
         *pcm_len = (DWORD)got * (DWORD)out_ch * 2u;
+        *pcm_out = (BYTE *)samples;
+
+        /* #region agent log */
+        {
+            char js[140];
+            snprintf(js, sizeof(js), "{\"got\":%d,\"pcm\":%lu,\"cap_sec\":%d,\"ch\":%d,\"rate\":%u}", got,
+                     (unsigned long)*pcm_len, max_sec, out_ch, (unsigned)vi.sample_rate);
+            dm_agent(max_sec < 0 ? "H44" : "H35", "dm_replace.c:decode_to_pcm",
+                     max_sec < 0 ? "ogg-decode-full" : "ogg-decode", js);
+        }
+        /* #endregion */
+        return 1;
     }
-    *pcm_out = (BYTE *)samples;
-    /* #region agent log */
-    {
-        char js[140];
-        snprintf(js, sizeof(js), "{\"got\":%d,\"pcm\":%lu,\"cap_sec\":%d,\"ch\":%d,\"rate\":%u}", got,
-                 (unsigned long)*pcm_len, max_sec, vi.channels, (unsigned)vi.sample_rate);
-        dm_agent("H35", "dm_replace.c:decode_to_pcm", "ogg-decode", js);
-    }
-    /* #endregion */
-    return 1;
 }
 
 enum { PCM_CACHE_N = 64 };
