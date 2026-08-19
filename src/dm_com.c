@@ -1326,6 +1326,7 @@ static HRESULT STDMETHODCALLTYPE perf_InitAudio(CkPerf *This, void **ppDM, void 
         *ppDS = This->ds;
         IDirectSound_AddRef(This->ds);
     }
+    This->music_wasapi = audio_wasapi_init(This->hwnd) ? 1 : 0;
 
     live_cs_enter();
     g_active_perf = This;
@@ -1341,8 +1342,8 @@ static HRESULT STDMETHODCALLTYPE perf_InitAudio(CkPerf *This, void **ppDM, void 
              (unsigned long)(ULONG_PTR)This->hwnd, (unsigned long)(ULONG_PTR)This->ds);
     dm_agent("R1", "dm_replace.c:InitAudio", "init-audio", js);
     /* #endregion */
-    log_msg("dm-replace: InitAudio hr=0x%08lx flags=0x%lx ds=%p", (unsigned long)hr,
-            (unsigned long)flags, (void *)This->ds);
+    log_msg("dm-replace: InitAudio hr=0x%08lx flags=0x%lx ds=%p wasapi=%d", (unsigned long)hr,
+            (unsigned long)flags, (void *)This->ds, This->music_wasapi);
     return SUCCEEDED(hr) ? S_OK : hr;
 }
 
@@ -1529,6 +1530,8 @@ static HRESULT STDMETHODCALLTYPE perf_CloseDown(CkPerf *This)
 {
     stop_all_live_sfx();
     stop_music_buf();
+    if (This->music_wasapi)
+        audio_wasapi_shutdown();
     notif_clear_all(This);
     if (This->primary) {
         IDirectSoundBuffer_Release(This->primary);

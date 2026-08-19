@@ -851,8 +851,12 @@ void path_propagate_volume(CkPath *path)
         live_cs_leave();
         if (perf) {
         EnterCriticalSection(&perf->lock);
-        if (path->id == perf->music_path_id && perf->music_buf)
-            IDirectSoundBuffer_SetVolume(perf->music_buf, vol);
+        if (path->id == perf->music_path_id) {
+            if (perf->music_wasapi)
+                audio_wasapi_set_volume(vol);
+            else if (perf->music_buf)
+                IDirectSoundBuffer_SetVolume(perf->music_buf, vol);
+        }
         LeaveCriticalSection(&perf->lock);
             ck_perf_release(perf);
         }
@@ -1255,6 +1259,8 @@ void stop_music_buf(void)
     live_cs_leave();
     if (!p)
         return;
+    if (p->music_wasapi)
+        audio_wasapi_stop();
     EnterCriticalSection(&p->lock);
     buf = p->music_buf;
     seg = p->music_seg;
@@ -1314,7 +1320,10 @@ int segment_is_playing(CkSegment *seg)
     live_cs_leave();
     if (perf) {
         EnterCriticalSection(&perf->lock);
-        playing = perf->music_buf && perf->music_seg == seg;
+        if (perf->music_wasapi)
+            playing = (perf->music_seg == seg) && audio_wasapi_is_playing();
+        else
+            playing = perf->music_buf && perf->music_seg == seg;
         LeaveCriticalSection(&perf->lock);
         ck_perf_release(perf);
     }
@@ -1469,6 +1478,31 @@ static HRESULT play_pcm_music_start(CkPerf *perf, CkSegment *seg, CkPath *apath,
     return S_OK;
 }
 
+static HRESULT play_pcm_music_wasapi(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags, LONG pvol)
+{
+    LPDIRECTSOUNDBUFFER old_buf;
+    CkSegment *old_seg;
+    int fade_transition = (flags & CK_PLAY_FADE_TRANSITION) != 0;
+    if (!audio_wasapi_play(seg->pcm, seg->pcm_bytes, &seg->fmt, seg->repeats == (DWORD)-1, pvol))
+        return E_FAIL;
+    EnterCriticalSection(&perf->lock);
+    old_buf = perf->music_buf;
+    old_seg = perf->music_seg;
+    perf->music_buf = NULL;
+    perf->music_seg = seg;
+    ck_segment_addref(seg);
+    perf->music_path_id = apath ? apath->id : 0;
+    LeaveCriticalSection(&perf->lock);
+    music_release_old(old_buf, old_seg, fade_transition, pvol);
+    {
+        DWORD md = seg->fmt.nAvgBytesPerSec
+                       ? (DWORD)((ULONGLONG)seg->pcm_bytes * 1000ull / seg->fmt.nAvgBytesPerSec)
+                       : 1000u;
+        music_note_started(seg->path, seg->repeats == (DWORD)-1, md, pvol, 0);
+    }
+    return S_OK;
+}
+
 static HRESULT play_pcm_music_sync(CkPerf *perf, CkSegment *seg, DWORD flags, LONG pvol)
 {
     DSBUFFERDESC desc;
@@ -1574,6 +1608,8 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
     pvol = apath ? InterlockedCompareExchange(&apath->vol, 0, 0) : 0;
 
     if (is_music) {
+        if (perf->music_wasapi)
+            return play_pcm_music_wasapi(perf, seg, apath, flags, pvol);
         LPDIRECTSOUNDBUFFER cached = NULL;
         music_cache_build_ds_for_path(perf->ds, seg->path);
         if (music_cache_try_acquire_ds_buf(seg->path, &cached) && cached)

@@ -171,6 +171,7 @@ typedef struct {
     CRITICAL_SECTION lock;
     HANDLE notif_event;
     int notif_segment;
+    int music_wasapi;
     CkNotifSlot notif[CK_NOTIF_SLOTS];
 } CkPerf;
 
@@ -269,6 +270,12 @@ void music_prefetch_full_async(const char *path);
 void music_prefetch_siblings(const char *current_rel);
 int music_cache_build_ds_for_path(LPDIRECTSOUND ds, const char *path);
 int music_cache_try_acquire_ds_buf(const char *path, LPDIRECTSOUNDBUFFER *out);
+int audio_wasapi_init(HWND hwnd);
+void audio_wasapi_shutdown(void);
+int audio_wasapi_play(const BYTE *pcm, DWORD pcm_bytes, const WAVEFORMATEX *fmt, int loop, LONG vol);
+void audio_wasapi_stop(void);
+int audio_wasapi_is_playing(void);
+void audio_wasapi_set_volume(LONG vol);
 void ensure_game_dir(void);
 const char *dm_game_dir(void);
 int scrape_stream_path(void *stream, char *out, size_t outn);

@@ -62,6 +62,7 @@ asi_normal_src = files(
   'dm_pcm.c',
   'dm_voice.c',
   'dm_assets.c',
+  'audio_wasapi.c',
   'dm_com.c',
 )
 
