@@ -74,7 +74,7 @@ ASI_OBJS := $(SRCDIR)/dllmain.o $(SRCDIR)/log.o $(SRCDIR)/hooks.o \
             $(SRCDIR)/dm_native.o $(SRCDIR)/dm_trace.o $(SRCDIR)/stb_vorbis.o \
             $(SRCDIR)/dm_replace.o $(SRCDIR)/dm_guids.o $(SRCDIR)/dm_globals.o \
             $(SRCDIR)/dm_debug.o $(SRCDIR)/dm_pcm.o \
-            $(SRCDIR)/dm_voice.o $(SRCDIR)/dm_assets.o $(SRCDIR)/audio_wasapi.o $(SRCDIR)/dm_com.o \
+            $(SRCDIR)/dm_voice.o $(SRCDIR)/dm_assets.o $(SRCDIR)/audio_wasapi.o $(SRCDIR)/ck_music.o $(SRCDIR)/dm_com.o \
             $(MENU_OBJS)
 LDR_OBJS := $(SRCDIR)/loader/dllmain.o $(SRCDIR)/loader/proxy.o \
             $(SRCDIR)/loader/trampolines.o

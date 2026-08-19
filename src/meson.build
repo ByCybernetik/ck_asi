@@ -63,6 +63,7 @@ asi_normal_src = files(
   'dm_voice.c',
   'dm_assets.c',
   'audio_wasapi.c',
+  'ck_music.c',
   'dm_com.c',
 )
 

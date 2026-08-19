@@ -172,6 +172,7 @@ typedef struct {
     HANDLE notif_event;
     int notif_segment;
     int music_wasapi;
+    CkState *pending_music_state;
     CkNotifSlot notif[CK_NOTIF_SLOTS];
 } CkPerf;
 

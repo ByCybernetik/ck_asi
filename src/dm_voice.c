@@ -852,9 +852,9 @@ void path_propagate_volume(CkPath *path)
         if (perf) {
         EnterCriticalSection(&perf->lock);
         if (path->id == perf->music_path_id) {
-            if (perf->music_wasapi)
-                audio_wasapi_set_volume(vol);
-            else if (perf->music_buf)
+            extern void ck_music_set_volume(LONG);
+            ck_music_set_volume(vol);
+            if (perf->music_buf)
                 IDirectSoundBuffer_SetVolume(perf->music_buf, vol);
         }
         LeaveCriticalSection(&perf->lock);
@@ -1259,8 +1259,10 @@ void stop_music_buf(void)
     live_cs_leave();
     if (!p)
         return;
-    if (p->music_wasapi)
-        audio_wasapi_stop();
+    {
+        extern void ck_music_stop(void);
+        ck_music_stop();
+    }
     EnterCriticalSection(&p->lock);
     buf = p->music_buf;
     seg = p->music_seg;
@@ -1320,10 +1322,12 @@ int segment_is_playing(CkSegment *seg)
     live_cs_leave();
     if (perf) {
         EnterCriticalSection(&perf->lock);
-        if (perf->music_wasapi)
-            playing = (perf->music_seg == seg) && audio_wasapi_is_playing();
-        else
-            playing = perf->music_buf && perf->music_seg == seg;
+        {
+            extern int ck_music_is_playing(void);
+            playing = (perf->music_seg == seg) && ck_music_is_playing();
+            if (!playing)
+                playing = perf->music_buf && perf->music_seg == seg;
+        }
         LeaveCriticalSection(&perf->lock);
         ck_perf_release(perf);
     }
@@ -1439,6 +1443,7 @@ typedef struct {
     DWORD flags;
     LONG pvol;
     HMODULE module;
+    CkState *state;
 } MusicPlayJob;
 
 static HRESULT play_pcm_music_start(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags,
@@ -1474,6 +1479,17 @@ static HRESULT play_pcm_music_start(CkPerf *perf, CkSegment *seg, CkPath *apath,
         music_note_started(seg->path, loop_play, md, pvol, 0);
         if (!loop_play && !music_path_is_menu(seg->path))
             music_prefetch_siblings(seg->path);
+        if (!loop_play && md > 500u) {
+            CkState *pst = NULL;
+            EnterCriticalSection(&perf->lock);
+            pst = perf->pending_music_state;
+            perf->pending_music_state = NULL;
+            LeaveCriticalSection(&perf->lock);
+            if (pst) {
+                notif_schedule_segend(perf, pst, md);
+                InterlockedDecrement(&pst->refs);
+            }
+        }
     }
     return S_OK;
 }
@@ -1579,7 +1595,14 @@ static HRESULT play_pcm_music_sync(CkPerf *perf, CkSegment *seg, DWORD flags, LO
 static DWORD WINAPI music_async_play_proc(void *arg)
 {
     MusicPlayJob *job = (MusicPlayJob *)arg;
-    play_pcm_music_sync(job->perf, job->seg, job->flags, job->pvol);
+    HRESULT hr = play_pcm_music_sync(job->perf, job->seg, job->flags, job->pvol);
+    if (SUCCEEDED(hr) && job->state && job->seg->fmt.nAvgBytesPerSec && job->seg->pcm_bytes) {
+        DWORD dur = (DWORD)((ULONGLONG)job->seg->pcm_bytes * 1000ull / job->seg->fmt.nAvgBytesPerSec);
+        notif_schedule_segend(job->perf, job->state, dur);
+    }
+    if (job->state) {
+        InterlockedDecrement(&job->state->refs);
+    }
     ck_segment_release(job->seg);
     ck_perf_release(job->perf);
     {
@@ -1594,6 +1617,7 @@ static HRESULT music_play_async(CkPerf *perf, CkSegment *seg, CkPath *apath, DWO
 {
     MusicPlayJob *job;
     HANDLE th;
+    (void)apath;
 
     job = (MusicPlayJob *)calloc(1, sizeof(*job));
     if (!job)
@@ -1604,6 +1628,7 @@ static HRESULT music_play_async(CkPerf *perf, CkSegment *seg, CkPath *apath, DWO
     job->seg = seg;
     job->flags = flags;
     job->pvol = pvol;
+    job->state = NULL;
     job->module = dm_pin_module((const void *)music_async_play_proc);
     if (!job->module) {
         ck_segment_release(seg);
@@ -1655,14 +1680,24 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
     pvol = apath ? InterlockedCompareExchange(&apath->vol, 0, 0) : 0;
 
     if (is_music) {
-        if (perf->music_wasapi) {
-            HRESULT whr = play_pcm_music_wasapi(perf, seg, apath, flags, pvol);
-            if (whr != E_NOTIMPL)
-                return whr;
-            perf->music_wasapi = 0;
-            log_msg("dm-replace: WASAPI play failed, falling back to DirectSound");
+        extern int ck_music_play(const char *, int, LONG);
+        extern int ck_music_is_playing(void);
+        if (ck_music_play(seg->path, loop_play, pvol)) {
+            LPDIRECTSOUNDBUFFER old_buf;
+            CkSegment *old_seg;
+            int fade_transition = (flags & CK_PLAY_FADE_TRANSITION) != 0;
+            EnterCriticalSection(&perf->lock);
+            old_buf = perf->music_buf;
+            old_seg = perf->music_seg;
+            perf->music_buf = NULL;
+            perf->music_seg = seg;
+            ck_segment_addref(seg);
+            perf->music_path_id = apath ? apath->id : 0;
+            LeaveCriticalSection(&perf->lock);
+            music_release_old(old_buf, old_seg, fade_transition, pvol);
+            return S_OK;
         }
-        return music_play_async(perf, seg, apath, flags, pvol);
+        return E_FAIL;
     }
 
     if (!seg->pcm || !seg->pcm_bytes)

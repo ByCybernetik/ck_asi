@@ -1,6 +1,30 @@
 #include "dm_replace_internal.h"
+#include "ck_music.h"
 
 static ULONG STDMETHODCALLTYPE state_Release(CkState *This);
+
+static void ckm_on_music_end(void *ctx)
+{
+    CkPerf *perf;
+    CkState *st;
+    (void)ctx;
+    live_cs_enter();
+    perf = g_active_perf;
+    if (perf)
+        ck_perf_addref(perf);
+    live_cs_leave();
+    if (!perf)
+        return;
+    EnterCriticalSection(&perf->lock);
+    st = perf->pending_music_state;
+    perf->pending_music_state = NULL;
+    LeaveCriticalSection(&perf->lock);
+    if (st) {
+        notif_schedule_segend(perf, st, 50);
+        InterlockedDecrement(&st->refs);
+    }
+    ck_perf_release(perf);
+}
 
 static void notif_clear_all(CkPerf *perf)
 {
@@ -1326,15 +1350,15 @@ static HRESULT STDMETHODCALLTYPE perf_InitAudio(CkPerf *This, void **ppDM, void 
         *ppDS = This->ds;
         IDirectSound_AddRef(This->ds);
     }
-    This->music_wasapi = audio_wasapi_init(This->hwnd) ? 1 : 0;
+    This->music_wasapi = 0;
 
     live_cs_enter();
     g_active_perf = This;
     live_cs_leave();
     This->clock_start_ms = GetTickCount();
 
-    /* Warm music OGG files off the game thread (H-AUD: tpw0 cold decode ~1.5s). */
-    music_preload_start();
+    ck_music_init(This->ds);
+    ck_music_set_end_callback(ckm_on_music_end, NULL);
 
     /* #region agent log */
     snprintf(js, sizeof(js),
@@ -1453,12 +1477,24 @@ static HRESULT STDMETHODCALLTYPE perf_PlaySegmentEx(CkPerf *This, void *source, 
     if (SUCCEEDED(hr) && st) {
         int music = !(flags & 0x80u) && path_is_music(seg->path);
         int loop = seg->repeats == (DWORD)-1;
-        /* Non-loop music needs SEGEND so the game can advance the playlist. */
         if (!music || !loop) {
-            DWORD dur = seg->fmt.nAvgBytesPerSec && seg->pcm_bytes
-                            ? (DWORD)((ULONGLONG)seg->pcm_bytes * 1000ull / seg->fmt.nAvgBytesPerSec)
-                            : 180000u;
-            notif_schedule_segend(This, st, dur);
+            if (seg->pcm && seg->pcm_bytes && seg->fmt.nAvgBytesPerSec) {
+                DWORD dur = (DWORD)((ULONGLONG)seg->pcm_bytes * 1000ull / seg->fmt.nAvgBytesPerSec);
+                notif_schedule_segend(This, st, dur);
+            } else if (music && !loop) {
+                /*
+                 * Async music: real duration unknown until worker decodes.
+                 * Stash state ref on perf for the worker to schedule SEGEND.
+                 */
+                EnterCriticalSection(&This->lock);
+                if (This->pending_music_state)
+                    InterlockedDecrement(&This->pending_music_state->refs);
+                This->pending_music_state = st;
+                InterlockedIncrement(&st->refs);
+                LeaveCriticalSection(&This->lock);
+            } else {
+                notif_schedule_segend(This, st, 1000u);
+            }
         }
     }
 
@@ -1532,8 +1568,7 @@ static HRESULT STDMETHODCALLTYPE perf_CloseDown(CkPerf *This)
 {
     stop_all_live_sfx();
     stop_music_buf();
-    if (This->music_wasapi)
-        audio_wasapi_shutdown();
+    ck_music_shutdown();
     notif_clear_all(This);
     if (This->primary) {
         IDirectSoundBuffer_Release(This->primary);
