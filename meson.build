@@ -11,5 +11,10 @@ project('ck_asi', ['c', 'cpp'],
 )
 
 gpu_scene = get_option('gpu_scene')
+logging = get_option('logging')
+
+if not logging
+  add_project_arguments('-DNO_LOG', language : ['c', 'cpp'])
+endif
 
 subdir('src')

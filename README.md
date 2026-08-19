@@ -14,10 +14,17 @@ meson setup builddir --cross-file cross/i686-w64-mingw32.txt
 meson compile -C builddir
 ```
 
-Without GPU terrain/decor/obj rendering:
+By default GPU terrain/decor/obj rendering and file logging are **off**. Enable with:
 
 ```bash
-meson setup builddir --cross-file cross/i686-w64-mingw32.txt -Dgpu_scene=false
+meson setup builddir --cross-file cross/i686-w64-mingw32.txt -Dgpu_scene=true -Dlogging=true
+meson compile -C builddir
+```
+
+Or reconfigure an existing build:
+
+```bash
+meson configure builddir -Dgpu_scene=false -Dlogging=false
 meson compile -C builddir
 ```
 
@@ -25,8 +32,8 @@ meson compile -C builddir
 
 ```bash
 git submodule update --init
-make                # CK.asi + winmm.dll
-make GPU_SCENE=0    # without GPU scene modules
+make                # CK.asi + winmm.dll (no GPU scene, no log file)
+make GPU_SCENE=1 LOGGING=1   # enable GPU scene + ck_asi.log
 make install        # → ../Imperivm/scripts/CK.asi + ../Imperivm/winmm.dll
 ```
 
@@ -96,4 +103,4 @@ loaders as `winmm.dll` at once.
 DirectMusic: `dm*.dll` / `dsound.dll` / `dswave.dll` next to the EXE are loaded via
 `CoCreateInstance` redirect (Wine otherwise uses builtin stubs from system32).
 
-Logs: `ck_asi.log` (next to the ASI), `ck_loader.log` (next to winmm).
+Logs (when built with `-Dlogging=true` / `LOGGING=1`): `ck_asi.log` (next to the ASI), `ck_loader.log` (next to winmm).

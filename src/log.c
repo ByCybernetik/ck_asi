@@ -1,5 +1,7 @@
 #include "log.h"
 
+#ifndef NO_LOG
+
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -89,3 +91,5 @@ void log_guid(const char *label, const GUID *guid)
             guid->Data4[4], guid->Data4[5],
             guid->Data4[6], guid->Data4[7]);
 }
+
+#endif /* !NO_LOG */

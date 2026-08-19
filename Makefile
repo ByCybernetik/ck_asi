@@ -7,11 +7,11 @@ SRCDIR  := src
 
 CFLAGS  := -O2 -Wall -Wextra -Wno-cast-function-type -Wno-unused-function \
            -DWINVER=0x0501 -D_WIN32_WINNT=0x0501 -mcrtdll=msvcrt-os \
-           $(NO_GPU_SCENE_FLAG)
+           $(NO_GPU_SCENE_FLAG) $(NO_LOG_FLAG)
 CXXFLAGS := -O2 -Wall -Wextra -std=c++17 \
            -DWINVER=0x0601 -D_WIN32_WINNT=0x0601 \
            -fno-exceptions -fno-rtti \
-           $(NO_GPU_SCENE_FLAG)
+           $(NO_GPU_SCENE_FLAG) $(NO_LOG_FLAG)
 VK_CFLAGS := -I$(VK_HDR_DIR) -idirafter /usr/include
 LDFLAGS := -shared -static-libgcc -static-libstdc++ \
            -Wl,--kill-at -Wl,--enable-stdcall-fix \
@@ -26,7 +26,8 @@ FT_LIBS    := -L$(FT_LIBDIR) -lfreetype
 
 VK_HDR_DIR := third_party/Vulkan-Headers/include
 
-GPU_SCENE ?= 1
+GPU_SCENE ?= 0
+LOGGING   ?= 0
 
 GAME_DIR ?= ../Imperivm
 GAME_DIR_I2 ?= ../Imperivm 2
@@ -49,6 +50,10 @@ MENU_OBJS := $(SRCDIR)/menu/ck_menu_host.o \
 GPU_SCENE_OBJS := $(SRCDIR)/ktx_gpu_terrain.o $(SRCDIR)/vk_terrain.o \
                   $(SRCDIR)/vk_iso_depth.o $(SRCDIR)/vk_decor.o \
                   $(SRCDIR)/vk_obj.o $(SRCDIR)/vk_soft_overlay.o
+
+ifeq ($(LOGGING),0)
+  NO_LOG_FLAG := -DNO_LOG
+endif
 
 ifeq ($(GPU_SCENE),0)
   NO_GPU_SCENE_FLAG := -DNO_GPU_SCENE
