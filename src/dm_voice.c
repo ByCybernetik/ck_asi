@@ -1482,9 +1482,26 @@ static HRESULT play_pcm_music_wasapi(CkPerf *perf, CkSegment *seg, CkPath *apath
 {
     LPDIRECTSOUNDBUFFER old_buf;
     CkSegment *old_seg;
+    BYTE *raw = NULL;
+    DWORD raw_len = 0;
     int fade_transition = (flags & CK_PLAY_FADE_TRANSITION) != 0;
-    if (!audio_wasapi_play(seg->pcm, seg->pcm_bytes, &seg->fmt, seg->repeats == (DWORD)-1, pvol))
+    int loop_play = seg->repeats == (DWORD)-1;
+    DWORD dur_ms;
+
+    if (FAILED(load_wav_file_or_pak(seg->path, &raw, &raw_len)) || !raw || raw_len < 4) {
+        free(raw);
         return E_FAIL;
+    }
+    if (memcmp(raw, "OggS", 4) != 0) {
+        free(raw);
+        return E_FAIL;
+    }
+    if (!audio_wasapi_play_ogg(raw, raw_len, loop_play, pvol)) {
+        free(raw);
+        return E_FAIL;
+    }
+    free(raw);
+
     EnterCriticalSection(&perf->lock);
     old_buf = perf->music_buf;
     old_seg = perf->music_seg;
@@ -1494,12 +1511,12 @@ static HRESULT play_pcm_music_wasapi(CkPerf *perf, CkSegment *seg, CkPath *apath
     perf->music_path_id = apath ? apath->id : 0;
     LeaveCriticalSection(&perf->lock);
     music_release_old(old_buf, old_seg, fade_transition, pvol);
-    {
-        DWORD md = seg->fmt.nAvgBytesPerSec
-                       ? (DWORD)((ULONGLONG)seg->pcm_bytes * 1000ull / seg->fmt.nAvgBytesPerSec)
-                       : 1000u;
-        music_note_started(seg->path, seg->repeats == (DWORD)-1, md, pvol, 0);
-    }
+
+    dur_ms = seg->fmt.nAvgBytesPerSec
+                 ? (DWORD)((ULONGLONG)seg->pcm_bytes * 1000ull / seg->fmt.nAvgBytesPerSec)
+                 : 1000u;
+    if (dur_ms < 1000u) dur_ms = 180000u;
+    music_note_started(seg->path, loop_play, dur_ms, pvol, 0);
     return S_OK;
 }
 
@@ -1595,7 +1612,7 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
     int use_softpan = 0;
     int fade_transition = (flags & CK_PLAY_FADE_TRANSITION) != 0;
 
-    if (!perf || !perf->ds || !seg || !seg->pcm || !seg->pcm_bytes)
+    if (!perf || !perf->ds || !seg)
         return E_FAIL;
 
     if (apath && !InterlockedCompareExchange((LONG *)&apath->active, 0, 0))
@@ -1616,6 +1633,9 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
             return play_pcm_music_start(perf, seg, apath, flags, pvol, cached, loop_play);
         return music_play_async(perf, seg, apath, flags, pvol);
     }
+
+    if (!seg->pcm || !seg->pcm_bytes)
+        return E_FAIL;
 
     if (!is_music && apath && apath->id)
         path_stop_live_sfx(apath->id);

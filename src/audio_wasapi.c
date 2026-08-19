@@ -8,6 +8,19 @@
 #include <mmdeviceapi.h>
 #include <math.h>
 
+typedef struct stb_vorbis stb_vorbis;
+typedef struct {
+    unsigned int sample_rate;
+    int channels;
+} stb_vorbis_info;
+extern stb_vorbis *stb_vorbis_open_memory(const unsigned char *data, int len, int *error,
+                                           const void *alloc);
+extern stb_vorbis_info stb_vorbis_get_info(stb_vorbis *f);
+extern int stb_vorbis_get_samples_short_interleaved(stb_vorbis *f, int channels, short *buffer,
+                                                     int num_shorts);
+extern void stb_vorbis_close(stb_vorbis *f);
+extern int stb_vorbis_seek_start(stb_vorbis *f);
+
 typedef struct {
     IMMDevice *dev;
     IAudioClient *client;
@@ -18,20 +31,22 @@ typedef struct {
     CRITICAL_SECTION lock;
     int lock_ready;
     volatile LONG run;
-    volatile LONG started;
     volatile LONG active;
-    BYTE *src_pcm;
-    DWORD src_bytes;
-    WAVEFORMATEX src_fmt;
-    double src_pos;
-    double src_step;
-    DWORD src_frames;
+
+    stb_vorbis *vorbis;
+    int vorbis_ch;
+    int vorbis_rate;
     int loop;
     LONG vol;
     int mix_float;
+
+    short *decode_buf;
+    int decode_buf_samples;
 } WasapiState;
 
 static WasapiState g_wasapi;
+
+enum { DECODE_CHUNK = 4096 };
 
 static float dsvol_to_linear(LONG vol)
 {
@@ -44,79 +59,106 @@ static float dsvol_to_linear(LONG vol)
 
 static void wasapi_fill(BYTE *dst, UINT32 frames)
 {
-    UINT32 ch, f;
+    UINT32 ch, f, wrote;
     float gain;
     WasapiState *s = &g_wasapi;
     if (!dst || !s->mixfmt)
         return;
     ch = s->mixfmt->nChannels ? s->mixfmt->nChannels : 2;
     gain = dsvol_to_linear(s->vol);
+    wrote = 0;
 
-    if (s->mix_float) {
-        float *out = (float *)dst;
-        for (f = 0; f < frames; ++f) {
-            float l = 0.0f, r = 0.0f;
-            if (s->active && s->src_pcm && s->src_frames) {
-                DWORD i = (DWORD)s->src_pos;
-                short *src16 = (short *)s->src_pcm;
-                if (i >= s->src_frames) {
-                    if (s->loop) {
-                        s->src_pos = 0.0;
-                        i = 0;
-                    } else {
-                        s->active = 0;
-                    }
-                }
-                if (s->active) {
-                    if (s->src_fmt.nChannels >= 2) {
-                        l = (float)src16[i * 2 + 0] / 32768.0f;
-                        r = (float)src16[i * 2 + 1] / 32768.0f;
-                    } else {
-                        l = r = (float)src16[i] / 32768.0f;
-                    }
-                    s->src_pos += s->src_step;
-                }
+    while (wrote < frames) {
+        UINT32 need = frames - wrote;
+        UINT32 have = 0;
+        int got;
+
+        if (!s->active || !s->vorbis) {
+            if (s->mix_float) {
+                float *out = (float *)dst + wrote * ch;
+                for (f = 0; f < need * ch; ++f)
+                    out[f] = 0.0f;
+            } else {
+                memset((short *)dst + wrote * ch, 0, need * ch * sizeof(short));
             }
-            l *= gain;
-            r *= gain;
-            out[f * ch + 0] = l;
-            if (ch > 1)
-                out[f * ch + 1] = r;
-            for (UINT32 c = 2; c < ch; ++c)
-                out[f * ch + c] = 0.5f * (l + r);
+            return;
         }
-    } else {
-        short *out = (short *)dst;
-        for (f = 0; f < frames; ++f) {
-            int l = 0, r = 0;
-            if (s->active && s->src_pcm && s->src_frames) {
-                DWORD i = (DWORD)s->src_pos;
-                short *src16 = (short *)s->src_pcm;
-                if (i >= s->src_frames) {
-                    if (s->loop) {
-                        s->src_pos = 0.0;
-                        i = 0;
-                    } else {
-                        s->active = 0;
-                    }
-                }
-                if (s->active) {
-                    if (s->src_fmt.nChannels >= 2) {
-                        l = src16[i * 2 + 0];
-                        r = src16[i * 2 + 1];
-                    } else {
-                        l = r = src16[i];
-                    }
-                    s->src_pos += s->src_step;
-                }
+
+        if (need > (UINT32)DECODE_CHUNK)
+            need = DECODE_CHUNK;
+
+        got = stb_vorbis_get_samples_short_interleaved(
+            s->vorbis, s->vorbis_ch, s->decode_buf, (int)(need * s->vorbis_ch));
+
+        if (got <= 0) {
+            if (s->loop) {
+                stb_vorbis_seek_start(s->vorbis);
+                continue;
             }
-            l = (int)((float)l * gain);
-            r = (int)((float)r * gain);
-            out[f * ch + 0] = (short)l;
-            if (ch > 1)
-                out[f * ch + 1] = (short)r;
-            for (UINT32 c = 2; c < ch; ++c)
-                out[f * ch + c] = (short)((l + r) / 2);
+            s->active = 0;
+            if (s->mix_float) {
+                float *out = (float *)dst + wrote * ch;
+                for (f = 0; f < (frames - wrote) * ch; ++f)
+                    out[f] = 0.0f;
+            } else {
+                memset((short *)dst + wrote * ch, 0,
+                       (frames - wrote) * ch * sizeof(short));
+            }
+            return;
+        }
+        have = (UINT32)got;
+
+        if (s->mix_float) {
+            float *out = (float *)dst + wrote * ch;
+            double step = (double)s->vorbis_rate / (double)s->mixfmt->nSamplesPerSec;
+            double pos = 0.0;
+            UINT32 out_frames = (UINT32)((double)have / step);
+            if (out_frames > frames - wrote)
+                out_frames = frames - wrote;
+            for (f = 0; f < out_frames; ++f) {
+                UINT32 si = (UINT32)pos;
+                float l, r;
+                if (si >= have) si = have - 1;
+                if (s->vorbis_ch >= 2) {
+                    l = (float)s->decode_buf[si * 2 + 0] / 32768.0f;
+                    r = (float)s->decode_buf[si * 2 + 1] / 32768.0f;
+                } else {
+                    l = r = (float)s->decode_buf[si] / 32768.0f;
+                }
+                l *= gain; r *= gain;
+                out[f * ch + 0] = l;
+                if (ch > 1) out[f * ch + 1] = r;
+                for (UINT32 c = 2; c < ch; ++c)
+                    out[f * ch + c] = 0.0f;
+                pos += step;
+            }
+            wrote += out_frames;
+        } else {
+            double step = (double)s->vorbis_rate / (double)s->mixfmt->nSamplesPerSec;
+            double pos = 0.0;
+            short *out = (short *)dst + wrote * ch;
+            UINT32 out_frames = (UINT32)((double)have / step);
+            if (out_frames > frames - wrote)
+                out_frames = frames - wrote;
+            for (f = 0; f < out_frames; ++f) {
+                UINT32 si = (UINT32)pos;
+                int l, r;
+                if (si >= have) si = have - 1;
+                if (s->vorbis_ch >= 2) {
+                    l = s->decode_buf[si * 2 + 0];
+                    r = s->decode_buf[si * 2 + 1];
+                } else {
+                    l = r = s->decode_buf[si];
+                }
+                l = (int)((float)l * gain);
+                r = (int)((float)r * gain);
+                out[f * ch + 0] = (short)l;
+                if (ch > 1) out[f * ch + 1] = (short)r;
+                for (UINT32 c = 2; c < ch; ++c)
+                    out[f * ch + c] = 0;
+                pos += step;
+            }
+            wrote += out_frames;
         }
     }
 }
@@ -127,18 +169,17 @@ static DWORD WINAPI wasapi_thread_proc(void *arg)
     if (!s->client || !s->render || !s->ev)
         return 0;
     IAudioClient_Start(s->client);
-    s->started = 1;
     while (s->run) {
-        UINT32 pad = 0, frames = 0, avail = 0;
+        UINT32 pad = 0, buf_frames = 0, avail = 0;
         BYTE *dst = NULL;
         WaitForSingleObject(s->ev, 50);
         if (FAILED(IAudioClient_GetCurrentPadding(s->client, &pad)))
             continue;
-        if (FAILED(IAudioClient_GetBufferSize(s->client, &frames)))
+        if (FAILED(IAudioClient_GetBufferSize(s->client, &buf_frames)))
             continue;
-        if (pad >= frames)
+        if (pad >= buf_frames)
             continue;
-        avail = frames - pad;
+        avail = buf_frames - pad;
         if (FAILED(IAudioRenderClient_GetBuffer(s->render, avail, &dst)))
             continue;
         if (s->lock_ready)
@@ -149,7 +190,6 @@ static DWORD WINAPI wasapi_thread_proc(void *arg)
         IAudioRenderClient_ReleaseBuffer(s->render, avail, 0);
     }
     IAudioClient_Stop(s->client);
-    s->started = 0;
     return 0;
 }
 
@@ -157,7 +197,7 @@ int audio_wasapi_init(HWND hwnd)
 {
     HRESULT hr;
     IMMDeviceEnumerator *en = NULL;
-    REFERENCE_TIME dur = 1000000; /* 100ms */
+    REFERENCE_TIME dur = 1000000;
     WAVEFORMATEX *mix = NULL;
     WasapiState *s = &g_wasapi;
     const char *backend = getenv("CK_AUDIO_BACKEND");
@@ -201,11 +241,17 @@ int audio_wasapi_init(HWND hwnd)
     s->lock_ready = 1;
     s->vol = 0;
     s->mix_float = (s->mixfmt->wBitsPerSample == 32) ? 1 : 0;
+    s->decode_buf = (short *)malloc(DECODE_CHUNK * 2 * sizeof(short));
+    if (!s->decode_buf)
+        goto fail;
     s->run = 1;
     s->thread = CreateThread(NULL, 0, wasapi_thread_proc, s, 0, NULL);
     if (!s->thread)
         goto fail;
     IMMDeviceEnumerator_Release(en);
+    log_msg("dm-replace: WASAPI streaming init ok mixfmt=%uHz %uch %ubit",
+            (unsigned)s->mixfmt->nSamplesPerSec, (unsigned)s->mixfmt->nChannels,
+            (unsigned)s->mixfmt->wBitsPerSample);
     return 1;
 fail:
     if (en)
@@ -226,6 +272,14 @@ void audio_wasapi_shutdown(void)
         WaitForSingleObject(s->thread, 500);
         CloseHandle(s->thread);
     }
+    if (s->lock_ready)
+        EnterCriticalSection(&s->lock);
+    if (s->vorbis) {
+        stb_vorbis_close(s->vorbis);
+        s->vorbis = NULL;
+    }
+    if (s->lock_ready)
+        LeaveCriticalSection(&s->lock);
     if (s->render)
         IAudioRenderClient_Release(s->render);
     if (s->client)
@@ -236,23 +290,37 @@ void audio_wasapi_shutdown(void)
         CoTaskMemFree(s->mixfmt);
     if (s->ev)
         CloseHandle(s->ev);
+    free(s->decode_buf);
     if (s->lock_ready)
         DeleteCriticalSection(&s->lock);
     memset(s, 0, sizeof(*s));
 }
 
-int audio_wasapi_play(const BYTE *pcm, DWORD pcm_bytes, const WAVEFORMATEX *fmt, int loop, LONG vol)
+int audio_wasapi_play_ogg(const BYTE *ogg_data, DWORD ogg_len, int loop, LONG vol)
 {
     WasapiState *s = &g_wasapi;
-    if (!s->thread || !fmt || !pcm || !pcm_bytes || fmt->nBlockAlign == 0 || fmt->nSamplesPerSec == 0)
+    stb_vorbis *v;
+    stb_vorbis_info vi;
+    int err = 0;
+
+    if (!s->thread || !ogg_data || !ogg_len)
         return 0;
+
+    v = stb_vorbis_open_memory(ogg_data, (int)ogg_len, &err, NULL);
+    if (!v)
+        return 0;
+    vi = stb_vorbis_get_info(v);
+    if (vi.channels < 1 || vi.sample_rate < 1) {
+        stb_vorbis_close(v);
+        return 0;
+    }
+
     EnterCriticalSection(&s->lock);
-    s->src_pcm = (BYTE *)pcm;
-    s->src_bytes = pcm_bytes;
-    s->src_fmt = *fmt;
-    s->src_frames = pcm_bytes / fmt->nBlockAlign;
-    s->src_pos = 0.0;
-    s->src_step = (double)fmt->nSamplesPerSec / (double)s->mixfmt->nSamplesPerSec;
+    if (s->vorbis)
+        stb_vorbis_close(s->vorbis);
+    s->vorbis = v;
+    s->vorbis_ch = vi.channels;
+    s->vorbis_rate = (int)vi.sample_rate;
     s->loop = loop ? 1 : 0;
     s->vol = vol;
     s->active = 1;
@@ -269,9 +337,10 @@ void audio_wasapi_stop(void)
         return;
     EnterCriticalSection(&s->lock);
     s->active = 0;
-    s->src_pcm = NULL;
-    s->src_bytes = 0;
-    s->src_frames = 0;
+    if (s->vorbis) {
+        stb_vorbis_close(s->vorbis);
+        s->vorbis = NULL;
+    }
     LeaveCriticalSection(&s->lock);
 }
 
