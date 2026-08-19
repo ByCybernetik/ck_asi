@@ -83,35 +83,64 @@ int decode_to_pcm(const BYTE *raw, DWORD raw_len, WAVEFORMATEX *fmt, BYTE **pcm_
 
     /* Music tracks are 3–8 min; OGG_DECODE_FULL must stay negative (0 was clamped to 1s). */
     if (max_sec < 0) {
-        int ch = 0, sr = 0, frames;
+        /*
+         * stb_vorbis_decode_memory uses v->channels internally for
+         * stb_vorbis_get_frame_short_interleaved.  Some game OGGs report
+         * 6-8 channels, causing stb_vorbis internal OOM (NULL channel_buffers)
+         * → crash.  Decode manually with stereo downmix instead.
+         */
+        stb_vorbis *vf;
+        stb_vorbis_info vfi;
+        int limit_f, total_s, offset_s = 0, data_len = 0, err2 = 0;
         short *out = NULL;
+        const int out_ch = 2;
 
-        frames = stb_vorbis_decode_memory(raw, (int)raw_len, &ch, &sr, &out);
-        if (frames <= 0 || !out || ch < 1 || sr < 1) {
-            /* #region agent log */
-            {
-                char js[120];
-                snprintf(js, sizeof(js), "{\"frames\":%d,\"err\":%d}", frames, frames);
-                dm_agent("H44", "dm_replace.c:decode_to_pcm", "ogg-decode-full-fail", js);
-            }
-            /* #endregion */
-            free(out);
+        vf = stb_vorbis_open_memory(raw, (int)raw_len, &err2, NULL);
+        if (!vf) {
+            dm_agent("H44", "dm_replace.c:decode_to_pcm", "ogg-decode-full-fail", "{\"err\":1}");
             return 0;
         }
+        vfi = stb_vorbis_get_info(vf);
+        if (vfi.channels < 1 || vfi.sample_rate < 1) {
+            stb_vorbis_close(vf);
+            return 0;
+        }
+        limit_f = 4096;
+        total_s = limit_f * out_ch;
+        out = (short *)malloc((size_t)total_s * sizeof(short));
+        if (!out) { stb_vorbis_close(vf); return 0; }
+        for (;;) {
+            int n = stb_vorbis_get_frame_short_interleaved(vf, out_ch,
+                        out + offset_s, total_s - offset_s);
+            if (n == 0) break;
+            data_len += n;
+            offset_s += n * out_ch;
+            if (offset_s + limit_f * out_ch > total_s) {
+                short *nb;
+                total_s *= 2;
+                nb = (short *)realloc(out, (size_t)total_s * sizeof(short));
+                if (!nb) { free(out); stb_vorbis_close(vf); return 0; }
+                out = nb;
+            }
+        }
+        stb_vorbis_close(vf);
+        if (data_len <= 0 || !out) { free(out); return 0; }
         fmt->wFormatTag = WAVE_FORMAT_PCM;
-        fmt->nChannels = (WORD)ch;
-        fmt->nSamplesPerSec = (DWORD)sr;
+        fmt->nChannels = (WORD)out_ch;
+        fmt->nSamplesPerSec = (DWORD)vfi.sample_rate;
         fmt->wBitsPerSample = 16;
-        fmt->nBlockAlign = (WORD)(ch * 2);
+        fmt->nBlockAlign = (WORD)(out_ch * 2);
         fmt->nAvgBytesPerSec = fmt->nSamplesPerSec * fmt->nBlockAlign;
-        *pcm_len = (DWORD)frames * (DWORD)ch * 2u;
+        *pcm_len = (DWORD)data_len * (DWORD)out_ch * 2u;
         *pcm_out = (BYTE *)out;
         /* #region agent log */
         {
             char js[180];
             snprintf(js, sizeof(js),
                      "{\"got\":%d,\"pcm\":%lu,\"cap_sec\":0,\"dur_sec\":%.2f,\"ch\":%d,\"rate\":%u}",
-                     frames, (unsigned long)*pcm_len, (double)frames / (double)sr, ch, (unsigned)sr);
+                     data_len, (unsigned long)*pcm_len,
+                     (double)data_len / (double)vfi.sample_rate,
+                     out_ch, (unsigned)vfi.sample_rate);
             dm_agent("H44", "dm_replace.c:decode_to_pcm", "ogg-decode-full", js);
         }
         /* #endregion */
@@ -132,25 +161,28 @@ int decode_to_pcm(const BYTE *raw, DWORD raw_len, WAVEFORMATEX *fmt, BYTE **pcm_
     max_frames = (int)vi.sample_rate * max_sec;
     if (max_frames < 1)
         max_frames = 1;
-    buf_shorts = max_frames * vi.channels;
-    samples = (short *)malloc((size_t)buf_shorts * sizeof(short));
-    if (!samples) {
+    {
+        const int out_ch = 2;
+        buf_shorts = max_frames * out_ch;
+        samples = (short *)malloc((size_t)buf_shorts * sizeof(short));
+        if (!samples) {
+            stb_vorbis_close(v);
+            return 0;
+        }
+        got = stb_vorbis_get_samples_short_interleaved(v, out_ch, samples, buf_shorts);
         stb_vorbis_close(v);
-        return 0;
+        if (got <= 0) {
+            free(samples);
+            return 0;
+        }
+        fmt->wFormatTag = WAVE_FORMAT_PCM;
+        fmt->nChannels = (WORD)out_ch;
+        fmt->nSamplesPerSec = (DWORD)vi.sample_rate;
+        fmt->wBitsPerSample = 16;
+        fmt->nBlockAlign = (WORD)(out_ch * 2);
+        fmt->nAvgBytesPerSec = fmt->nSamplesPerSec * fmt->nBlockAlign;
+        *pcm_len = (DWORD)got * (DWORD)out_ch * 2u;
     }
-    got = stb_vorbis_get_samples_short_interleaved(v, vi.channels, samples, buf_shorts);
-    stb_vorbis_close(v);
-    if (got <= 0) {
-        free(samples);
-        return 0;
-    }
-    fmt->wFormatTag = WAVE_FORMAT_PCM;
-    fmt->nChannels = (WORD)vi.channels;
-    fmt->nSamplesPerSec = (DWORD)vi.sample_rate;
-    fmt->wBitsPerSample = 16;
-    fmt->nBlockAlign = (WORD)(vi.channels * 2);
-    fmt->nAvgBytesPerSec = fmt->nSamplesPerSec * fmt->nBlockAlign;
-    *pcm_len = (DWORD)got * (DWORD)vi.channels * 2u;
     *pcm_out = (BYTE *)samples;
     /* #region agent log */
     {
