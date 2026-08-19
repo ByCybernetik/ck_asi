@@ -265,6 +265,8 @@ BYTE *music_cache_intern_acquire(const char *path, const WAVEFORMATEX *fmt, BYTE
 void music_cache_release(const char *path, const BYTE *pcm);
 void music_cache_collect(void);
 void music_preload_start(void);
+void music_prefetch_full_async(const char *path);
+void music_prefetch_siblings(const char *current_rel);
 void ensure_game_dir(void);
 const char *dm_game_dir(void);
 int scrape_stream_path(void *stream, char *out, size_t outn);

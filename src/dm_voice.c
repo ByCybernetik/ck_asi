@@ -961,6 +961,8 @@ static int g_music_auto; /* non-menu one-shot → advance randomly */
 static LONG g_music_vol;
 static int g_music_rand_seeded;
 
+static int music_fill_pool(char names[][80], int maxn);
+
 static int music_path_is_menu(const char *path)
 {
     char t[260];
@@ -979,7 +981,7 @@ static int music_path_is_menu(const char *path)
     return strstr(t, "_MENU") != NULL;
 }
 
-static void music_note_started(const char *path, int loop, DWORD dur_ms, LONG vol)
+static void music_note_started(const char *path, int loop, DWORD dur_ms, LONG vol, int enable_auto)
 {
     g_music_vol = vol;
     g_music_looping = loop ? 1 : 0;
@@ -989,12 +991,62 @@ static void music_note_started(const char *path, int loop, DWORD dur_ms, LONG vo
     } else {
         g_music_last[0] = '\0';
     }
-    /* Menu (_menu) loops; mission BGM is one-shot + random next (original PlayRandomMusic). */
-    g_music_auto = (!loop && path && path[0] && !music_path_is_menu(path)) ? 1 : 0;
+    /*
+     * Mission BGM advances via SEGEND → game GetObject/PlaySegmentEx.
+     * Do not also auto-advance in music_tick (duplicate decode froze the render thread).
+     */
+    g_music_auto = enable_auto && (!loop && path && path[0] && !music_path_is_menu(path)) ? 1 : 0;
     if (g_music_auto)
         g_music_done_tick = GetTickCount() + (dur_ms > 50u ? dur_ms : 50u);
     else
         g_music_done_tick = 0;
+}
+
+void music_prefetch_siblings(const char *current_rel)
+{
+    char pool[MUSIC_POOL_MAX][80];
+    char rel[260];
+    int n, i, prefetched, start;
+
+    n = music_fill_pool(pool, MUSIC_POOL_MAX);
+    if (n < 1)
+        return;
+    if (!g_music_rand_seeded) {
+        srand((unsigned)(GetTickCount() ^ GetCurrentThreadId()));
+        g_music_rand_seeded = 1;
+    }
+    start = n > 1 ? (rand() % n) : 0;
+    prefetched = 0;
+    for (i = 0; i < n && prefetched < 2; ++i) {
+        const char *fname = pool[(start + i) % n];
+        snprintf(rel, sizeof(rel), "music\\%s", fname);
+        if (current_rel && current_rel[0]) {
+            char tcur[260], ttry[260];
+            size_t j;
+            for (j = 0; current_rel[j] && j + 1 < sizeof(tcur); ++j) {
+                char c = current_rel[j];
+                if (c >= 'a' && c <= 'z')
+                    c = (char)(c - 'a' + 'A');
+                if (c == '/')
+                    c = '\\';
+                tcur[j] = c;
+            }
+            tcur[j] = '\0';
+            for (j = 0; rel[j] && j + 1 < sizeof(ttry); ++j) {
+                char c = rel[j];
+                if (c >= 'a' && c <= 'z')
+                    c = (char)(c - 'a' + 'A');
+                if (c == '/')
+                    c = '\\';
+                ttry[j] = c;
+            }
+            ttry[j] = '\0';
+            if (strcmp(tcur, ttry) == 0)
+                continue;
+        }
+        music_prefetch_full_async(rel);
+        prefetched++;
+    }
 }
 
 static void music_clear_state(void)
@@ -1107,17 +1159,15 @@ static int music_play_rel(CkPerf *perf, const char *fname)
                    DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_STATIC;
     desc.dwBufferBytes = pcm_len;
     desc.lpwfxFormat = &fmt;
-    EnterCriticalSection(&perf->lock);
     hr = IDirectSound_CreateSoundBuffer(perf->ds, &desc, &buf, NULL);
     if (SUCCEEDED(hr) && buf) {
         if (!ds_buf_write_all(buf, pcm, pcm_len))
             hr = E_FAIL;
-        else
-            hr = IDirectSoundBuffer_Play(buf, 0, 0, 0);
-        if (SUCCEEDED(hr))
+        else {
             path_apply_buf_vol(buf, g_music_vol);
+            hr = IDirectSoundBuffer_Play(buf, 0, 0, 0);
+        }
     }
-    LeaveCriticalSection(&perf->lock);
     if (cached)
         music_cache_release(rel, pcm);
     /* Shared music-cache buffers must not be freed. */
@@ -1140,7 +1190,8 @@ static int music_play_rel(CkPerf *perf, const char *fname)
     perf->music_path_id = 0;
     LeaveCriticalSection(&perf->lock);
     dur_ms = fmt.nAvgBytesPerSec ? (DWORD)((ULONGLONG)pcm_len * 1000ull / fmt.nAvgBytesPerSec) : 1000u;
-    music_note_started(rel, 0, dur_ms, g_music_vol);
+    music_note_started(rel, 0, dur_ms, g_music_vol, 1);
+    music_prefetch_siblings(rel);
     log_msg("dm-replace: random music '%s' (%lu ms)%s", rel, (unsigned long)dur_ms,
             cached ? " [cache]" : "");
     return 1;
@@ -1484,9 +1535,8 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
             desc.lpwfxFormat = &seg->fmt;
         }
 
-        EnterCriticalSection(&perf->lock);
         hr = IDirectSound_CreateSoundBuffer(perf->ds, &desc, &buf, NULL);
-        if (SUCCEEDED(hr)) {
+        if (SUCCEEDED(hr) && buf) {
             if (render) {
                 if (!ds_buf_write_all(buf, render, render_bytes))
                     hr = E_FAIL;
@@ -1501,16 +1551,12 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
             }
             if (SUCCEEDED(hr)) {
                 DWORD play_flags = loop_play ? DSBPLAY_LOOPING : 0;
+                path_apply_buf_vol(buf, pvol);
+                if (!use_softpan && !is_music && apath)
+                    path_apply_buf_pan(buf, InterlockedCompareExchange(&apath->pan, 0, 0));
                 hr = IDirectSoundBuffer_Play(buf, 0, 0, play_flags);
-                if (SUCCEEDED(hr)) {
-                    path_apply_buf_vol(buf, pvol);
-                    if (!use_softpan && !is_music && apath)
-                        path_apply_buf_pan(
-                            buf, InterlockedCompareExchange(&apath->pan, 0, 0));
-                }
             }
         }
-        LeaveCriticalSection(&perf->lock);
         free(render);
     }
 
@@ -1532,7 +1578,9 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
                 DWORD md = seg->fmt.nAvgBytesPerSec
                                ? (DWORD)((ULONGLONG)seg->pcm_bytes * 1000ull / seg->fmt.nAvgBytesPerSec)
                                : 1000u;
-                music_note_started(seg->path, loop_play, md, pvol);
+                music_note_started(seg->path, loop_play, md, pvol, 0);
+                if (!loop_play && path_is_music(seg->path) && !music_path_is_menu(seg->path))
+                    music_prefetch_siblings(seg->path);
             }
         } else {
             live_cs_enter();

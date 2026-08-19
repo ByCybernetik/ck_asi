@@ -529,12 +529,16 @@ static int music_prefetch_claim(const char *key)
 static DWORD WINAPI music_prefetch_full_proc(void *arg)
 {
     char *path = (char *)arg;
+    HMODULE module = NULL;
     BYTE *raw = NULL, *pcm = NULL;
     DWORD raw_len = 0, pcm_len = 0;
     WAVEFORMATEX fmt;
     LONGLONG t0;
     double ms;
 
+    if (!path)
+        goto out;
+    module = dm_pin_module((const void *)music_prefetch_full_proc);
     t0 = hitch_qpc_now();
     if (SUCCEEDED(load_wav_file_or_pak(path, &raw, &raw_len)) && raw &&
         decode_to_pcm(raw, raw_len, &fmt, &pcm, &pcm_len, OGG_DECODE_FULL) && pcm) {
@@ -543,12 +547,15 @@ static DWORD WINAPI music_prefetch_full_proc(void *arg)
         log_msg("dm-replace: music prefetch full '%s' pcm=%lu ms=%.1f", path,
                 (unsigned long)pcm_len, ms);
     }
+out:
     free(raw);
     free(path);
+    if (module)
+        dm_worker_exit(module, 0);
     return 0;
 }
 
-static void music_prefetch_full_async(const char *path)
+void music_prefetch_full_async(const char *path)
 {
     char key[260];
     char *dup;

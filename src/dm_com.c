@@ -1694,9 +1694,9 @@ static HRESULT STDMETHODCALLTYPE ldr_GetObject(CkLoader *This, void *pDesc, REFI
         free(raw);
         raw = NULL;
         if (is_music) {
-            /* Full decode into music cache — DS STATIC buffer must hold the whole track. */
             pcm_buf =
                 music_cache_intern_acquire(scraped, &fmt, pcm_buf, pcm_len, &pcm_cached);
+            music_prefetch_siblings(scraped);
         } else
             cache_put(scraped, &fmt, pcm_buf, pcm_len);
         if (n <= 30 || (n % 50) == 0 || is_music || ms_load + ms_dec >= 5.0) {
