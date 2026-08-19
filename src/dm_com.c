@@ -66,9 +66,6 @@ void notif_schedule_segend(CkPerf *perf, CkState *st, DWORD dur_ms)
     s->phase = 1;
     LeaveCriticalSection(&perf->lock);
 
-    if (perf->notif_event)
-        SetEvent(perf->notif_event);
-
     /* #region agent log */
     {
         char js[220];
@@ -87,6 +84,28 @@ void notif_schedule_segend(CkPerf *perf, CkState *st, DWORD dur_ms)
         dm_agent("H51", "dm_replace.c:notif", "notif-sched", js);
     }
     /* #endregion */
+}
+
+void notif_tick(CkPerf *perf)
+{
+    int i, ready = 0;
+    DWORD now;
+    HANDLE event;
+    if (!perf)
+        return;
+    now = GetTickCount();
+    EnterCriticalSection(&perf->lock);
+    event = perf->notif_event;
+    for (i = 0; i < CK_NOTIF_SLOTS; ++i) {
+        if (perf->notif[i].phase == 1 &&
+            (LONG)(now - perf->notif[i].fire_ms) >= 0) {
+            ready = 1;
+            break;
+        }
+    }
+    LeaveCriticalSection(&perf->lock);
+    if (ready && event)
+        SetEvent(event);
 }
 
 static HRESULT STDMETHODCALLTYPE perf_GetNotificationPMsg(CkPerf *This, void **ppMsg)
@@ -498,22 +517,88 @@ static ULONG STDMETHODCALLTYPE path_Release(CkPath *This)
 }
 static HRESULT STDMETHODCALLTYPE path_QI(CkPath *This, REFIID riid, void **ppv)
 {
-    (void)riid;
     if (!ppv)
         return E_POINTER;
+    if (!riid || (!IsEqualGUID(riid, &IID_IUnknown) &&
+                  !IsEqualGUID(riid, &IID_IDirectMusicAudioPath8))) {
+        *ppv = NULL;
+        return E_NOINTERFACE;
+    }
     *ppv = This;
     path_AddRef(This);
     return S_OK;
 }
+
+typedef struct {
+    CkPath *path;
+    LONG from;
+    LONG to;
+    LONG generation;
+    DWORD duration_ms;
+} CkVolumeRamp;
+
+static DWORD WINAPI path_volume_ramp_proc(void *arg)
+{
+    CkVolumeRamp *ramp = (CkVolumeRamp *)arg;
+    DWORD start = GetTickCount();
+    for (;;) {
+        DWORD elapsed = GetTickCount() - start;
+        if (ramp->path->volume_generation != ramp->generation)
+            break;
+        if (elapsed >= ramp->duration_ms) {
+            ramp->path->vol = ramp->to;
+            path_propagate_volume(ramp->path);
+            break;
+        }
+        ramp->path->vol =
+            ramp->from + (LONG)(((LONGLONG)(ramp->to - ramp->from) * elapsed) /
+                                ramp->duration_ms);
+        path_propagate_volume(ramp->path);
+        Sleep(16);
+    }
+    path_Release(ramp->path);
+    free(ramp);
+    return 0;
+}
+
 /* Game FUN_0040be40(this=path): call [*(path+4)->vtbl+0x14](self, vol, 0) = SetVolume@12. */
 static HRESULT STDMETHODCALLTYPE path_SetVolume(CkPath *This, LONG vol, DWORD dur)
 {
-    (void)dur;
+    CkVolumeRamp *ramp;
+    HANDLE thread;
+    LONG from;
     if (!This)
         return E_POINTER;
+    vol = path_clamp_vol(vol);
+    from = This->vol;
+    InterlockedIncrement(&This->volume_generation);
+    if (!dur || from == vol) {
+        This->vol = vol;
+        path_propagate_volume(This);
+        return S_OK;
+    }
+    ramp = (CkVolumeRamp *)calloc(1, sizeof(*ramp));
+    if (!ramp) {
+        This->vol = vol;
+        path_propagate_volume(This);
+        return E_OUTOFMEMORY;
+    }
+    ramp->path = This;
+    ramp->from = from;
+    ramp->to = vol;
+    ramp->generation = This->volume_generation;
+    ramp->duration_ms = dur > 60000u ? 60000u : dur;
+    path_AddRef(This);
+    thread = CreateThread(NULL, 0, path_volume_ramp_proc, ramp, 0, NULL);
+    if (thread) {
+        CloseHandle(thread);
+        return S_OK;
+    }
+    path_Release(This);
+    free(ramp);
     This->vol = vol;
     path_propagate_volume(This);
-    return S_OK;
+    return HRESULT_FROM_WIN32(GetLastError());
 }
 static HRESULT STDMETHODCALLTYPE path_Activate(CkPath *This, BOOL on)
 {
@@ -620,6 +705,7 @@ static void init_dsctrl_vt(void)
 static CkDsCtrl *path_ensure_ctrl_proxy(CkPath *path)
 {
     CkDsCtrl *px;
+    CkPerf *perf;
     if (!path)
         return NULL;
     if (path->ctrl_proxy)
@@ -649,8 +735,16 @@ static HRESULT STDMETHODCALLTYPE path_GetObjectInPath(CkPath *This, DWORD pch, D
     if (!ppObject)
         return E_POINTER;
     *ppObject = NULL;
-    if (!This || stage != 0x6000u || !g_active_perf || !g_active_perf->ds)
+    live_cs_enter();
+    perf = g_active_perf;
+    if (perf)
+        ck_perf_addref(perf);
+    live_cs_leave();
+    if (!This || stage != 0x6000u || !perf || !perf->ds) {
+        if (perf)
+            ck_perf_release(perf);
         return E_FAIL;
+    }
 
     if (!This->ctrl) {
         DSBUFFERDESC desc;
@@ -674,9 +768,10 @@ static HRESULT STDMETHODCALLTYPE path_GetObjectInPath(CkPath *This, DWORD pch, D
         desc.dwBufferBytes = sizeof(silence);
         desc.lpwfxFormat = &wfx;
         memset(silence, 0, sizeof(silence));
-        hr = IDirectSound_CreateSoundBuffer(g_active_perf->ds, &desc, &This->ctrl, NULL);
+        hr = IDirectSound_CreateSoundBuffer(perf->ds, &desc, &This->ctrl, NULL);
         if (FAILED(hr) || !This->ctrl) {
             This->ctrl = NULL;
+            ck_perf_release(perf);
             return E_FAIL;
         }
         if (SUCCEEDED(IDirectSoundBuffer_Lock(This->ctrl, 0, sizeof(silence), &p1, &n1, &p2, &n2, 0))) {
@@ -691,10 +786,13 @@ static HRESULT STDMETHODCALLTYPE path_GetObjectInPath(CkPath *This, DWORD pch, D
     }
 
     px = path_ensure_ctrl_proxy(This);
-    if (!px)
+    if (!px) {
+        ck_perf_release(perf);
         return E_OUTOFMEMORY;
+    }
     dsc_AddRef(px);
     *ppObject = px;
+    ck_perf_release(perf);
     return S_OK;
 }
 
@@ -778,16 +876,61 @@ static HRESULT STDMETHODCALLTYPE state_GetSegment(CkState *This, void **segment)
 }
 
 /* -------- segment -------- */
+static CkSegment *g_segments;
+
+static void segment_register(CkSegment *seg)
+{
+    live_cs_enter();
+    seg->registry_next = g_segments;
+    g_segments = seg;
+    live_cs_leave();
+}
+
+static void segment_unregister(CkSegment *seg)
+{
+    CkSegment **link;
+    live_cs_enter();
+    for (link = &g_segments; *link; link = &(*link)->registry_next) {
+        if (*link == seg) {
+            *link = seg->registry_next;
+            break;
+        }
+    }
+    seg->registry_next = NULL;
+    live_cs_leave();
+}
+
 static void segment_destroy(CkSegment *seg)
 {
     if (!seg)
         return;
+    segment_unregister(seg);
     if (seg->pcm_cached)
         music_cache_release(seg->path, seg->pcm);
     else
         free(seg->pcm);
     seg->pcm = NULL;
     free(seg);
+}
+
+static void segments_collect_retired(int force)
+{
+    CkSegment *seg, *next;
+    live_cs_enter();
+    seg = g_segments;
+    while (seg) {
+        next = seg->registry_next;
+        if (seg->refs <= 0 && (force || seg->unloaded))
+            segment_destroy(seg);
+        seg = next;
+    }
+    live_cs_leave();
+}
+
+void dm_com_collect_all(void)
+{
+    segments_collect_retired(1);
+    music_cache_collect();
 }
 
 ULONG ck_segment_addref(CkSegment *seg)
@@ -986,25 +1129,35 @@ static HRESULT STDMETHODCALLTYPE seg_InitPlay(CkSegment *This, void **ppState, v
 
 /* -------- WAV / DS play -------- */
 /* -------- performance -------- */
-static ULONG STDMETHODCALLTYPE perf_AddRef(CkPerf *This)
+ULONG ck_perf_addref(CkPerf *This)
 {
     return (ULONG)InterlockedIncrement(&This->refs);
 }
-static ULONG STDMETHODCALLTYPE perf_Release(CkPerf *This)
+ULONG ck_perf_release(CkPerf *This)
 {
-    LONG r = InterlockedDecrement(&This->refs);
+    LONG r;
+    live_cs_enter();
+    r = InterlockedDecrement(&This->refs);
+    if (r == 0 && g_active_perf == This)
+        g_active_perf = NULL;
+    live_cs_leave();
     if (r == 0) {
+        LPDIRECTSOUNDBUFFER music_buf;
+        CkSegment *music_seg;
         beacon_stop();
         notif_clear_all(This);
-        if (g_active_perf == This) {
-            stop_music_buf();
-            g_active_perf = NULL;
-        } else if (This->music_buf) {
-            IDirectSoundBuffer_Stop(This->music_buf);
-            IDirectSoundBuffer_Release(This->music_buf);
+        EnterCriticalSection(&This->lock);
+        music_buf = This->music_buf;
+        music_seg = This->music_seg;
+        This->music_buf = NULL;
+        This->music_seg = NULL;
+        LeaveCriticalSection(&This->lock);
+        if (music_buf) {
+            IDirectSoundBuffer_Stop(music_buf);
+            IDirectSoundBuffer_Release(music_buf);
         }
-        if (This->music_seg)
-            ck_segment_release(This->music_seg);
+        if (music_seg)
+            ck_segment_release(music_seg);
         if (This->primary)
             IDirectSoundBuffer_Release(This->primary);
         if (This->ds)
@@ -1014,11 +1167,22 @@ static ULONG STDMETHODCALLTYPE perf_Release(CkPerf *This)
     }
     return (ULONG)r;
 }
+static ULONG STDMETHODCALLTYPE perf_AddRef(CkPerf *This)
+{
+    return ck_perf_addref(This);
+}
+static ULONG STDMETHODCALLTYPE perf_Release(CkPerf *This)
+{
+    return ck_perf_release(This);
+}
 static HRESULT STDMETHODCALLTYPE perf_QI(CkPerf *This, REFIID riid, void **ppv)
 {
     if (!ppv)
         return E_POINTER;
-    if (!riid || IsEqualGUID(riid, &IID_IUnknown) || IsEqualGUID(riid, &IID_IDirectMusicPerformance8)) {
+    if (!riid || IsEqualGUID(riid, &IID_IUnknown) ||
+        IsEqualGUID(riid, &IID_IDirectMusicPerformance) ||
+        IsEqualGUID(riid, &IID_IDirectMusicPerformance2) ||
+        IsEqualGUID(riid, &IID_IDirectMusicPerformance8)) {
         *ppv = This;
         perf_AddRef(This);
         return S_OK;
@@ -1076,7 +1240,9 @@ static HRESULT STDMETHODCALLTYPE perf_InitAudio(CkPerf *This, void **ppDM, void 
             IDirectSound_AddRef(This->ds);
     }
 
+    live_cs_enter();
     g_active_perf = This;
+    live_cs_leave();
     This->clock_start_ms = GetTickCount();
 
     /* Warm music OGG files off the game thread (H-AUD: tpw0 cold decode ~1.5s). */
@@ -1149,7 +1315,6 @@ static HRESULT STDMETHODCALLTYPE perf_PlaySegmentEx(CkPerf *This, void *source, 
     CkPath *path = (CkPath *)(audiopath ? audiopath : from);
 
     (void)name;
-    (void)transition;
     (void)start;
 
     ck_ring_push(6, 45);
@@ -1174,7 +1339,8 @@ static HRESULT STDMETHODCALLTYPE perf_PlaySegmentEx(CkPerf *This, void *source, 
     }
     /* #endregion */
 
-    hr = play_pcm(This, seg, path, flags);
+    hr = play_pcm(This, seg, path,
+                  flags | (transition ? CK_PLAY_FADE_TRANSITION : 0));
 
     if (ppState) {
         st = (CkState *)calloc(1, sizeof(*st));
@@ -1225,20 +1391,18 @@ static HRESULT STDMETHODCALLTYPE perf_PlaySegmentEx(CkPerf *This, void *source, 
 
 static HRESULT STDMETHODCALLTYPE perf_Stop(CkPerf *This, void *seg, void *state, DWORD mt, DWORD flags)
 {
+    CkSegment *target = seg ? (CkSegment *)seg : (state ? ((CkState *)state)->seg : NULL);
+    int target_music = target ? path_is_music(target->path) : 0;
     (void)This;
     (void)mt;
     (void)flags;
-    if (seg)
-        stop_live_for_segment((CkSegment *)seg);
-    else if (state && ((CkState *)state)->seg)
-        stop_live_for_segment(((CkState *)state)->seg);
+    if (target)
+        stop_live_for_segment(target);
     else {
         stop_all_live_sfx();
         stop_music_buf();
     }
-    if ((seg && path_is_music(((CkSegment *)seg)->path)) ||
-        (state && ((CkState *)state)->seg &&
-         path_is_music(((CkState *)state)->seg->path)))
+    if (target_music)
         stop_music_buf();
     return S_OK;
 }
@@ -1254,8 +1418,9 @@ static HRESULT STDMETHODCALLTYPE perf_StopEx(CkPerf *This, void *obj, ULONGLONG 
     } else if (!IsBadReadPtr(obj, sizeof(void *))) {
         void **vt = *(void ***)obj;
         CkSegment *seg = vt == g_state_vt ? ((CkState *)obj)->seg : (CkSegment *)obj;
+        int is_music = seg ? path_is_music(seg->path) : 0;
         stop_live_for_segment(seg);
-        if (seg && path_is_music(seg->path))
+        if (is_music)
             stop_music_buf();
     }
     return S_OK;
@@ -1274,9 +1439,12 @@ static HRESULT STDMETHODCALLTYPE perf_CloseDown(CkPerf *This)
         IDirectSound_Release(This->ds);
         This->ds = NULL;
     }
+    segments_collect_retired(1);
     music_cache_collect();
+    live_cs_enter();
     if (g_active_perf == This)
         g_active_perf = NULL;
+    live_cs_leave();
     return S_OK;
 }
 
@@ -1296,15 +1464,15 @@ static HRESULT STDMETHODCALLTYPE ldr_QI(CkLoader *This, REFIID riid, void **ppv)
 {
     if (!ppv)
         return E_POINTER;
-    if (!riid || IsEqualGUID(riid, &IID_IUnknown) || IsEqualGUID(riid, &IID_IDirectMusicLoader8)) {
+    if (!riid || IsEqualGUID(riid, &IID_IUnknown) ||
+        IsEqualGUID(riid, &IID_IDirectMusicLoader) ||
+        IsEqualGUID(riid, &IID_IDirectMusicLoader8)) {
         *ppv = This;
         ldr_AddRef(This);
         return S_OK;
     }
-    /* Accept any — game may pass IID_Loader without 8 */
-    *ppv = This;
-    ldr_AddRef(This);
-    return S_OK;
+    *ppv = NULL;
+    return E_NOINTERFACE;
 }
 
 /* IDirectMusicLoader::ReleaseObject — drop the QI ref ba50 acquired (H52). */
@@ -1321,6 +1489,13 @@ static HRESULT STDMETHODCALLTYPE ldr_ReleaseObject(CkLoader *This, void *pObject
     if (pObject)
         ((ULONG(STDMETHODCALLTYPE *)(void *))(*(void ***)pObject)[2])(pObject);
     return S_OK;
+}
+
+static void STDMETHODCALLTYPE ldr_CollectGarbage(CkLoader *This)
+{
+    (void)This;
+    segments_collect_retired(0);
+    music_cache_collect();
 }
 
 /* Game ba50: loader vtbl+0x34 (slot 13), 2 stack args — must ret@8 (H52). */
@@ -1388,20 +1563,6 @@ static HRESULT STDMETHODCALLTYPE ldr_GetObject(CkLoader *This, void *pDesc, REFI
     /* Music: shared full-PCM cache (H-AUD). SFX: small copy cache. */
     if (path_is_music(scraped) && music_cache_acquire(scraped, &fmt, &pcm_buf, &pcm_len)) {
         pcm_cached = 1;
-        /* #region agent log */
-        {
-            FILE *df = fopen("/home/cybernetik/Games/Imperivm/ck_asi/.cursor/debug-764ba7.log", "a");
-            if (df) {
-                fprintf(df,
-                        "{\"sessionId\":\"764ba7\",\"runId\":\"hitch-map1\",\"hypothesisId\":\"H-AUD\","
-                        "\"location\":\"dm_com.c:GetObject\",\"message\":\"audio-cache-hit\","
-                        "\"data\":{\"n\":%ld,\"path\":\"%.100s\",\"pcm\":%lu,\"music\":1},"
-                        "\"timestamp\":%lu}\n",
-                        (long)n, scraped, (unsigned long)pcm_len, (unsigned long)GetTickCount());
-                fclose(df);
-            }
-        }
-        /* #endregion */
     } else if (!path_is_music(scraped) && cache_get(scraped, &fmt, &pcm_buf, &pcm_len)) {
         /* ok — SFX owned copy */
     } else {
@@ -1466,6 +1627,7 @@ static HRESULT STDMETHODCALLTYPE ldr_GetObject(CkLoader *This, void *pDesc, REFI
     seg->pcm = pcm_buf;
     seg->pcm_cached = pcm_cached;
     strncpy(seg->path, scraped, sizeof(seg->path) - 1);
+    segment_register(seg);
     *ppv = seg;
 
     /* #region agent log */
@@ -1526,7 +1688,7 @@ void init_vtables(void)
     g_ldr_vt[LDR_IDX_RELEASEOBJ] = (void *)ldr_ReleaseObject;
     g_ldr_vt[LDR_IDX_CLEARCACHE] = stub_by_argc(2);
     g_ldr_vt[LDR_IDX_ENABLECACHE] = stub_by_argc(3);
-    g_ldr_vt[LDR_IDX_COLLECTGARBAGE] = stub_by_argc(1);
+    g_ldr_vt[LDR_IDX_COLLECTGARBAGE] = (void *)ldr_CollectGarbage;
     g_ldr_vt[13] = (void *)ldr_slot13; /* ba50 +0x34 */
 
     for (i = 0; i < SEG_VT; ++i)

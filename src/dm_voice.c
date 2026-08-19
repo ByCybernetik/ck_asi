@@ -352,10 +352,20 @@ static void music_tick(void);
 
 void dm_replace_beacon_tick(void)
 {
+    CkPerf *perf;
     InterlockedIncrement(&g_beacon_tick_n);
     if (g_beacon_L && g_beacon_R)
         beacon_apply_spatial(0);
     spatial_tick_live();
+    live_cs_enter();
+    perf = g_active_perf;
+    if (perf)
+        ck_perf_addref(perf);
+    live_cs_leave();
+    if (perf) {
+        notif_tick(perf);
+        ck_perf_release(perf);
+    }
     music_tick();
 }
 
@@ -822,12 +832,20 @@ void path_propagate_volume(CkPath *path)
     vol = path_clamp_vol(path->vol);
     if (path->ctrl)
         IDirectSoundBuffer_SetVolume(path->ctrl, vol);
-    if (g_active_perf) {
-        CkPerf *perf = g_active_perf;
+    {
+        CkPerf *perf;
+        live_cs_enter();
+        perf = g_active_perf;
+        if (perf)
+            ck_perf_addref(perf);
+        live_cs_leave();
+        if (perf) {
         EnterCriticalSection(&perf->lock);
         if (path->id == perf->music_path_id && perf->music_buf)
             IDirectSoundBuffer_SetVolume(perf->music_buf, vol);
         LeaveCriticalSection(&perf->lock);
+            ck_perf_release(perf);
+        }
     }
     live_cs_enter();
     for (i = 0; i < s_live_n; i++) {
@@ -1144,28 +1162,38 @@ static void music_play_random_next(CkPerf *perf)
 
 static void music_tick(void)
 {
-    CkPerf *p = g_active_perf;
-    if (!g_music_auto || g_music_looping || !p)
+    CkPerf *p;
+    int should_advance = 0;
+    if (!g_music_auto || g_music_looping)
+        return;
+    live_cs_enter();
+    p = g_active_perf;
+    if (p)
+        ck_perf_addref(p);
+    live_cs_leave();
+    if (!p)
         return;
     EnterCriticalSection(&p->lock);
-    if (!p->music_buf) {
-        LeaveCriticalSection(&p->lock);
-        return;
-    }
+    should_advance = p->music_buf != NULL &&
+                     (LONG)(GetTickCount() - g_music_done_tick) >= 0;
     LeaveCriticalSection(&p->lock);
-    if ((LONG)(GetTickCount() - g_music_done_tick) < 0)
-        return;
-    /* Track finished — pick next like CVXMusicPlayer::PlayRandomMusic. */
-    music_play_random_next(p);
+    if (should_advance)
+        music_play_random_next(p);
+    ck_perf_release(p);
 }
 
 /* H59: Unload/movie must tear down looping BGM — music lives outside s_live. */
 void stop_music_buf(void)
 {
-    CkPerf *p = g_active_perf;
+    CkPerf *p;
     LPDIRECTSOUNDBUFFER buf;
     CkSegment *seg;
     music_clear_state();
+    live_cs_enter();
+    p = g_active_perf;
+    if (p)
+        ck_perf_addref(p);
+    live_cs_leave();
     if (!p)
         return;
     EnterCriticalSection(&p->lock);
@@ -1181,6 +1209,7 @@ void stop_music_buf(void)
     }
     if (seg)
         ck_segment_release(seg);
+    ck_perf_release(p);
 }
 
 void dm_replace_silence_music(void)
@@ -1216,13 +1245,19 @@ void stop_all_live_sfx(void)
 int segment_is_playing(CkSegment *seg)
 {
     int i, playing = 0;
-    CkPerf *perf = g_active_perf;
+    CkPerf *perf;
     if (!seg)
         return 0;
+    live_cs_enter();
+    perf = g_active_perf;
+    if (perf)
+        ck_perf_addref(perf);
+    live_cs_leave();
     if (perf) {
         EnterCriticalSection(&perf->lock);
         playing = perf->music_buf && perf->music_seg == seg;
         LeaveCriticalSection(&perf->lock);
+        ck_perf_release(perf);
     }
     if (playing)
         return 1;
@@ -1253,6 +1288,68 @@ void path_stop_live_sfx(DWORD path_id)
     live_cs_leave();
 }
 
+typedef struct {
+    LPDIRECTSOUNDBUFFER buf;
+    CkSegment *seg;
+    LONG start_vol;
+} CkMusicFade;
+
+static DWORD WINAPI music_fade_release_proc(void *arg)
+{
+    CkMusicFade *fade = (CkMusicFade *)arg;
+    int step;
+    for (step = 1; step <= 16; ++step) {
+        LONG vol = fade->start_vol + (DSBVOLUME_MIN - fade->start_vol) * step / 16;
+        IDirectSoundBuffer_SetVolume(fade->buf, path_clamp_vol(vol));
+        Sleep(16);
+    }
+    IDirectSoundBuffer_Stop(fade->buf);
+    IDirectSoundBuffer_Release(fade->buf);
+    if (fade->seg)
+        ck_segment_release(fade->seg);
+    free(fade);
+    return 0;
+}
+
+static void music_release_old(LPDIRECTSOUNDBUFFER buf, CkSegment *seg, int fade, LONG start_vol)
+{
+    CkMusicFade *ctx;
+    HANDLE thread;
+    if (!buf) {
+        if (seg)
+            ck_segment_release(seg);
+        return;
+    }
+    if (!fade) {
+        IDirectSoundBuffer_Stop(buf);
+        IDirectSoundBuffer_Release(buf);
+        if (seg)
+            ck_segment_release(seg);
+        return;
+    }
+    ctx = (CkMusicFade *)calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        IDirectSoundBuffer_Stop(buf);
+        IDirectSoundBuffer_Release(buf);
+        if (seg)
+            ck_segment_release(seg);
+        return;
+    }
+    ctx->buf = buf;
+    ctx->seg = seg;
+    ctx->start_vol = path_clamp_vol(start_vol);
+    thread = CreateThread(NULL, 0, music_fade_release_proc, ctx, 0, NULL);
+    if (thread) {
+        CloseHandle(thread);
+        return;
+    }
+    IDirectSoundBuffer_Stop(buf);
+    IDirectSoundBuffer_Release(buf);
+    if (seg)
+        ck_segment_release(seg);
+    free(ctx);
+}
+
 HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
 {
     DSBUFFERDESC desc;
@@ -1269,6 +1366,7 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
     LONG pvol;
     LONG ppan = 0;
     int use_softpan = 0;
+    int fade_transition = (flags & CK_PLAY_FADE_TRANSITION) != 0;
 
     if (!perf || !perf->ds || !seg || !seg->pcm || !seg->pcm_bytes)
         return E_FAIL;
@@ -1392,19 +1490,18 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
 
     if (SUCCEEDED(hr) && buf) {
         if (is_music) {
+            LPDIRECTSOUNDBUFFER old_buf;
+            CkSegment *old_seg;
             EnterCriticalSection(&perf->lock);
-            if (perf->music_buf) {
-                IDirectSoundBuffer_Stop(perf->music_buf);
-                IDirectSoundBuffer_Release(perf->music_buf);
-            }
-            if (perf->music_seg)
-                ck_segment_release(perf->music_seg);
+            old_buf = perf->music_buf;
+            old_seg = perf->music_seg;
             perf->music_buf = buf;
             perf->music_seg = seg;
             ck_segment_addref(seg);
             perf->music_path_id = apath ? apath->id : 0;
             buf = NULL;
             LeaveCriticalSection(&perf->lock);
+            music_release_old(old_buf, old_seg, fade_transition, pvol);
             {
                 DWORD md = seg->fmt.nAvgBytesPerSec
                                ? (DWORD)((ULONGLONG)seg->pcm_bytes * 1000ull / seg->fmt.nAvgBytesPerSec)

@@ -49,6 +49,17 @@ int dm_replace_enabled(void)
     return g_enabled;
 }
 
+void dm_replace_shutdown(void)
+{
+    if (!g_enabled)
+        return;
+    beacon_stop();
+    stop_all_live_sfx();
+    stop_music_buf();
+    dm_com_collect_all();
+    g_enabled = 0;
+}
+
 HRESULT dm_replace_cocreate(REFCLSID clsid, REFIID iid, void **ppv)
 {
     if (!g_enabled || !clsid || !ppv)
@@ -57,6 +68,11 @@ HRESULT dm_replace_cocreate(REFCLSID clsid, REFIID iid, void **ppv)
     init_vtables();
 
     if (IsEqualGUID(clsid, &CLSID_DMPerformance)) {
+        if (iid && !IsEqualGUID(iid, &IID_IUnknown) &&
+            !IsEqualGUID(iid, &IID_IDirectMusicPerformance) &&
+            !IsEqualGUID(iid, &IID_IDirectMusicPerformance2) &&
+            !IsEqualGUID(iid, &IID_IDirectMusicPerformance8))
+            return E_NOINTERFACE;
         CkPerf *p = (CkPerf *)calloc(1, sizeof(*p));
         if (!p)
             return E_OUTOFMEMORY;
@@ -64,19 +80,21 @@ HRESULT dm_replace_cocreate(REFCLSID clsid, REFIID iid, void **ppv)
         p->refs = 1;
         InitializeCriticalSection(&p->lock);
         *ppv = p;
-        (void)iid;
         dm_agent("R0", "dm_replace.c:cocreate", "cocreate-perf", "{\"ok\":1}");
         log_msg("dm-replace: CoCreate Performance stub %p", (void *)p);
         return S_OK;
     }
     if (IsEqualGUID(clsid, &CLSID_DMLoader)) {
+        if (iid && !IsEqualGUID(iid, &IID_IUnknown) &&
+            !IsEqualGUID(iid, &IID_IDirectMusicLoader) &&
+            !IsEqualGUID(iid, &IID_IDirectMusicLoader8))
+            return E_NOINTERFACE;
         CkLoader *l = (CkLoader *)calloc(1, sizeof(*l));
         if (!l)
             return E_OUTOFMEMORY;
         l->lpVtbl = g_ldr_vt;
         l->refs = 1;
         *ppv = l;
-        (void)iid;
         dm_agent("R0", "dm_replace.c:cocreate", "cocreate-loader", "{\"ok\":1}");
         log_msg("dm-replace: CoCreate Loader stub %p", (void *)l);
         return S_OK;

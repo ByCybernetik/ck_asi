@@ -431,26 +431,6 @@ BYTE *music_cache_intern_acquire(const char *path, const WAVEFORMATEX *fmt, BYTE
     return pcm;
 }
 
-int music_cache_retain(const char *path, const BYTE *pcm)
-{
-    char key[260];
-    int i, found = 0;
-    if (!path || !pcm)
-        return 0;
-    music_path_key(path, key, sizeof(key));
-    music_cache_ensure_cs();
-    EnterCriticalSection(&g_music_cs);
-    for (i = 0; i < g_music_cache_n; ++i) {
-        if (g_music_cache[i].pcm == pcm && strcmp(g_music_cache[i].path, key) == 0) {
-            InterlockedIncrement(&g_music_cache[i].refs);
-            found = 1;
-            break;
-        }
-    }
-    LeaveCriticalSection(&g_music_cs);
-    return found;
-}
-
 void music_cache_release(const char *path, const BYTE *pcm)
 {
     char key[260];
@@ -554,25 +534,12 @@ static DWORD WINAPI music_prefetch_full_proc(void *arg)
     WAVEFORMATEX fmt;
     LONGLONG t0;
     double ms;
-    FILE *df;
 
     t0 = hitch_qpc_now();
     if (SUCCEEDED(load_wav_file_or_pak(path, &raw, &raw_len)) && raw &&
         decode_to_pcm(raw, raw_len, &fmt, &pcm, &pcm_len, OGG_DECODE_FULL) && pcm) {
         pcm = music_cache_upgrade(path, &fmt, pcm, pcm_len);
         ms = hitch_qpc_ms_since(t0);
-        /* #region agent log */
-        df = fopen("/home/cybernetik/Games/Imperivm/ck_asi/.cursor/debug-764ba7.log", "a");
-        if (df) {
-            fprintf(df,
-                    "{\"sessionId\":\"764ba7\",\"runId\":\"post-fix\",\"hypothesisId\":\"H-AUD\","
-                    "\"location\":\"dm_assets.c:prefetch\",\"message\":\"audio-prefetch-done\","
-                    "\"data\":{\"path\":\"%.100s\",\"pcm\":%lu,\"ms\":%.2f},"
-                    "\"timestamp\":%lu}\n",
-                    path, (unsigned long)pcm_len, ms, (unsigned long)GetTickCount());
-            fclose(df);
-        }
-        /* #endregion */
         log_msg("dm-replace: music prefetch full '%s' pcm=%lu ms=%.1f", path,
                 (unsigned long)pcm_len, ms);
     }
@@ -620,7 +587,6 @@ static int music_preload_one(const char *rel, int *n_ok, int *n_skip, int *n_fai
     WAVEFORMATEX fmt;
     LONGLONG t0;
     double ms;
-    FILE *df;
     if (music_cache_get(rel, &fmt, &pcm, &pcm_len)) {
         (*n_skip)++;
         return 1;
@@ -646,18 +612,6 @@ static int music_preload_one(const char *rel, int *n_ok, int *n_skip, int *n_fai
         return 0;
     }
     (*n_ok)++;
-    /* #region agent log */
-    df = fopen("/home/cybernetik/Games/Imperivm/ck_asi/.cursor/debug-764ba7.log", "a");
-    if (df) {
-        fprintf(df,
-                "{\"sessionId\":\"764ba7\",\"runId\":\"hitch-map1\",\"hypothesisId\":\"H-AUD\","
-                "\"location\":\"dm_assets.c:preload\",\"message\":\"audio-preload\","
-                "\"data\":{\"path\":\"%.100s\",\"pcm\":%lu,\"ms\":%.2f},"
-                "\"timestamp\":%lu}\n",
-                rel, (unsigned long)pcm_len, ms, (unsigned long)GetTickCount());
-        fclose(df);
-    }
-    /* #endregion */
     log_msg("dm-replace: music preload '%s' pcm=%lu ms=%.1f", rel, (unsigned long)pcm_len, ms);
     return 1;
 }
@@ -668,21 +622,6 @@ static DWORD WINAPI music_preload_proc(void *arg)
     (void)arg;
     /* Only warm menu BGM. Full-folder preload (~800MB PCM) OOMs 32-bit and skips tpw*. */
     music_preload_one("music\\_menu.ogg", &n_ok, &n_skip, &n_fail);
-    /* #region agent log */
-    {
-        FILE *df = fopen("/home/cybernetik/Games/Imperivm/ck_asi/.cursor/debug-764ba7.log", "a");
-        if (df) {
-            fprintf(df,
-                    "{\"sessionId\":\"764ba7\",\"runId\":\"hitch-map1\",\"hypothesisId\":\"H-AUD\","
-                    "\"location\":\"dm_assets.c:preload\",\"message\":\"audio-preload-done\","
-                    "\"data\":{\"ok\":%d,\"skip\":%d,\"fail\":%d,\"cached\":%d,\"bytes\":%lu},"
-                    "\"timestamp\":%lu}\n",
-                    n_ok, n_skip, n_fail, g_music_cache_n, (unsigned long)g_music_cache_bytes,
-                    (unsigned long)GetTickCount());
-            fclose(df);
-        }
-    }
-    /* #endregion */
     log_msg("dm-replace: music preload done ok=%d skip=%d fail=%d cached=%d bytes=%lu", n_ok, n_skip,
             n_fail, g_music_cache_n, (unsigned long)g_music_cache_bytes);
     return 0;

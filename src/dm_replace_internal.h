@@ -62,6 +62,7 @@ enum {
 
 #define CK_DMUS_PMSGT_NOTIFICATION 3u
 #define CK_DMUS_NOTIFICATION_SEGEND 1u
+#define CK_PLAY_FADE_TRANSITION 0x40000000u
 #define CK_NOTIF_SLOTS 128
 
 #define CK_CAM_PTR_VA 0x007CA604u
@@ -77,12 +78,16 @@ extern const GUID CLSID_DMPerformance;
 extern const GUID CLSID_DMLoader;
 extern const GUID CLSID_DMSegment;
 extern const GUID IID_IDirectMusicPerformance8;
+extern const GUID IID_IDirectMusicPerformance;
+extern const GUID IID_IDirectMusicPerformance2;
 extern const GUID IID_IDirectMusicLoader8;
+extern const GUID IID_IDirectMusicLoader;
 extern const GUID IID_IDirectMusicSegment8;
 extern const GUID IID_IDirectMusicSegmentState8;
+extern const GUID IID_IDirectMusicAudioPath8;
 extern const GUID CK_GUID_NOTIFICATION_SEGMENT;
 
-typedef struct {
+typedef struct CkSegmentTag {
     void **lpVtbl;
     LONG refs;
     BYTE *pcm;
@@ -92,6 +97,7 @@ typedef struct {
     DWORD repeats;
     int pcm_cached;
     int unloaded;
+    struct CkSegmentTag *registry_next;
     char path[260];
 } CkSegment;
 
@@ -104,6 +110,7 @@ typedef struct {
     void *ctrl_proxy;
     LONG vol;
     LONG pan;
+    LONG volume_generation;
     int active;
 } CkPath;
 
@@ -252,7 +259,6 @@ int music_cache_acquire(const char *path, WAVEFORMATEX *fmt, BYTE **pcm, DWORD *
 BYTE *music_cache_intern(const char *path, const WAVEFORMATEX *fmt, BYTE *pcm, DWORD pcm_bytes);
 BYTE *music_cache_intern_acquire(const char *path, const WAVEFORMATEX *fmt, BYTE *pcm,
                                  DWORD pcm_bytes, int *cached);
-int music_cache_retain(const char *path, const BYTE *pcm);
 void music_cache_release(const char *path, const BYTE *pcm);
 void music_cache_collect(void);
 void music_preload_start(void);
@@ -284,8 +290,12 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags);
 /* ---- COM ---- */
 void init_vtables(void);
 void notif_schedule_segend(CkPerf *perf, CkState *st, DWORD dur_ms);
+void notif_tick(CkPerf *perf);
 void state_init(CkState *st, CkSegment *seg, DWORD repeats);
 ULONG ck_segment_addref(CkSegment *seg);
 ULONG ck_segment_release(CkSegment *seg);
+ULONG ck_perf_addref(CkPerf *perf);
+ULONG ck_perf_release(CkPerf *perf);
+void dm_com_collect_all(void);
 
 #endif /* CK_DM_REPLACE_INTERNAL_H */

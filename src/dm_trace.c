@@ -228,8 +228,6 @@ static int open_probe_file(const char *path, HANDLE *out)
         {
             static const char *bases[] = {
                 "assets_unpacked\\",
-                "Z:\\home\\cybernetik\\Games\\Imperivm\\Imperivm\\assets_unpacked\\",
-                "/home/cybernetik/Games/Imperivm/Imperivm/assets_unpacked/",
                 NULL};
             char full[640];
             for (i = 0; bases[i]; ++i) {

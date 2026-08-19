@@ -6,6 +6,7 @@
 
 /* COM stub replacing DirectMusic Performance/Loader (default ON; CK_DM_REPLACE=0 disables). */
 void dm_replace_install(void);
+void dm_replace_shutdown(void);
 int dm_replace_enabled(void);
 HRESULT dm_replace_cocreate(REFCLSID clsid, REFIID iid, void **ppv);
 /* Silence looping BGM (cutscenes). */
