@@ -17,7 +17,7 @@ typedef struct stb_vorbis stb_vorbis;
 typedef struct { unsigned int sample_rate; int channels; } stb_vorbis_info;
 extern stb_vorbis *stb_vorbis_open_memory(const unsigned char *, int, int *, const void *);
 extern stb_vorbis_info stb_vorbis_get_info(stb_vorbis *);
-extern int stb_vorbis_get_samples_short_interleaved(stb_vorbis *, int, short *, int);
+extern int stb_vorbis_get_frame_float(stb_vorbis *, int *, float ***);
 extern void stb_vorbis_close(stb_vorbis *);
 extern int stb_vorbis_seek_start(stb_vorbis *);
 
@@ -50,7 +50,7 @@ typedef struct {
     int loop;
     LONG vol;
 
-    short *decode_tmp;
+    float *decode_tmp;
     double resample_frac;
     int decode_pos;
     int decode_len;
@@ -71,21 +71,59 @@ static float dsvol_linear(LONG vol)
     return (float)pow(10.0, (double)vol / 2000.0);
 }
 
+static void ckm_downmix_frame(float **src, int src_ch, int frames, float *dst)
+{
+    int i;
+    if (!dst || frames <= 0)
+        return;
+    for (i = 0; i < frames; ++i) {
+        float l = 0.0f, r = 0.0f;
+        if (src_ch <= 0 || !src) {
+            dst[i * 2 + 0] = 0.0f;
+            dst[i * 2 + 1] = 0.0f;
+            continue;
+        }
+        if (src_ch == 1) {
+            float m = src[0] ? src[0][i] : 0.0f;
+            l = m;
+            r = m;
+        } else {
+            l = src[0] ? src[0][i] : 0.0f;
+            r = src[1] ? src[1][i] : 0.0f;
+            if (src_ch >= 3 && src[2]) {
+                float c = src[2][i] * 0.5f;
+                l += c;
+                r += c;
+            }
+            if (src_ch >= 4 && src[3])
+                l += src[3][i] * 0.5f;
+            if (src_ch >= 5 && src[4])
+                r += src[4][i] * 0.5f;
+        }
+        dst[i * 2 + 0] = l;
+        dst[i * 2 + 1] = r;
+    }
+}
+
 static int ckm_decode_more(CkMusicPlayer *p)
 {
-    int got;
+    int got = 0, ch = 0, tries;
+    float **outs = NULL;
     if (!p->vorbis) return 0;
     /*
-     * Always request CKM_OUT_CH (stereo) output regardless of source channel
-     * count.  stb_vorbis performs the downmix internally when the requested
-     * channel count differs from the file's.  This avoids allocating huge
-     * decode buffers for multichannel OGGs (some game files report 6-8ch)
-     * and prevents internal stb_vorbis OOM → NULL channel_buffer → crash.
+     * Avoid stb_vorbis short/interleaved conversion path for multichannel
+     * files; known implementations in the wild prefer float decode + external
+     * downmix for robustness.
      */
-    got = stb_vorbis_get_samples_short_interleaved(
-        p->vorbis, CKM_OUT_CH, p->decode_tmp,
-        CKM_DECODE_FRAMES * CKM_OUT_CH);
+    for (tries = 0; tries < 8; ++tries) {
+        got = stb_vorbis_get_frame_float(p->vorbis, &ch, &outs);
+        if (got > 0)
+            break;
+    }
     if (got <= 0) return 0;
+    if (got > CKM_DECODE_FRAMES)
+        got = CKM_DECODE_FRAMES;
+    ckm_downmix_frame(outs, ch, got, p->decode_tmp);
     p->decode_pos = 0;
     p->decode_len = got;
     return got;
@@ -107,8 +145,8 @@ static void ckm_read_sample(CkMusicPlayer *p, float *l, float *r)
     }
     {
         int idx = p->decode_pos * CKM_OUT_CH;
-        *l = (float)p->decode_tmp[idx]     / 32768.0f;
-        *r = (float)p->decode_tmp[idx + 1] / 32768.0f;
+        *l = p->decode_tmp[idx];
+        *r = p->decode_tmp[idx + 1];
     }
 }
 
@@ -243,7 +281,7 @@ int ck_music_init(LPDIRECTSOUND ds)
     IDirectSoundBuffer_Play(p->buf, 0, 0, DSBPLAY_LOOPING);
 
     InitializeCriticalSection(&p->lock);
-    p->decode_tmp = (short *)malloc(CKM_DECODE_FRAMES * 8 * sizeof(short));
+    p->decode_tmp = (float *)malloc(CKM_DECODE_FRAMES * CKM_OUT_CH * sizeof(float));
     if (!p->decode_tmp) {
         IDirectSoundBuffer_Release(p->buf);
         p->buf = NULL;

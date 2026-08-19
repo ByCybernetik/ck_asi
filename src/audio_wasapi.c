@@ -16,8 +16,7 @@ typedef struct {
 extern stb_vorbis *stb_vorbis_open_memory(const unsigned char *data, int len, int *error,
                                            const void *alloc);
 extern stb_vorbis_info stb_vorbis_get_info(stb_vorbis *f);
-extern int stb_vorbis_get_samples_short_interleaved(stb_vorbis *f, int channels, short *buffer,
-                                                     int num_shorts);
+extern int stb_vorbis_get_frame_float(stb_vorbis *f, int *channels, float ***output);
 extern void stb_vorbis_close(stb_vorbis *f);
 extern int stb_vorbis_seek_start(stb_vorbis *f);
 extern float stb_vorbis_stream_length_in_seconds(stb_vorbis *f);
@@ -43,7 +42,7 @@ typedef struct {
     LONG vol;
     int mix_float;
 
-    short *decode_buf;
+    float *decode_buf;
     int decode_buf_cap;
     int decode_buf_pos;
     int decode_buf_len;
@@ -63,18 +62,56 @@ static float dsvol_to_linear(LONG vol)
     return (float)pow(10.0, (double)vol / 2000.0);
 }
 
+static void wasapi_downmix_frame(float **src, int src_ch, int frames, float *dst)
+{
+    int i;
+    if (!dst || frames <= 0)
+        return;
+    for (i = 0; i < frames; ++i) {
+        float l = 0.0f, r = 0.0f;
+        if (src_ch <= 0 || !src) {
+            dst[i * 2 + 0] = 0.0f;
+            dst[i * 2 + 1] = 0.0f;
+            continue;
+        }
+        if (src_ch == 1) {
+            float m = src[0] ? src[0][i] : 0.0f;
+            l = m;
+            r = m;
+        } else {
+            l = src[0] ? src[0][i] : 0.0f;
+            r = src[1] ? src[1][i] : 0.0f;
+            if (src_ch >= 3 && src[2]) {
+                float c = src[2][i] * 0.5f;
+                l += c;
+                r += c;
+            }
+            if (src_ch >= 4 && src[3])
+                l += src[3][i] * 0.5f;
+            if (src_ch >= 5 && src[4])
+                r += src[4][i] * 0.5f;
+        }
+        dst[i * 2 + 0] = l;
+        dst[i * 2 + 1] = r;
+    }
+}
+
 static int wasapi_decode_more(WasapiState *s)
 {
-    int got;
+    int got = 0, ch = 0, tries;
+    float **outs = NULL;
     if (!s->vorbis)
         return 0;
-    /* Always decode to stereo — stb_vorbis handles the downmix.
-     * Prevents OOM / NULL channel_buffer crash with multichannel OGGs. */
-    got = stb_vorbis_get_samples_short_interleaved(
-        s->vorbis, 2, s->decode_buf,
-        DECODE_CHUNK * 2);
+    for (tries = 0; tries < 8; ++tries) {
+        got = stb_vorbis_get_frame_float(s->vorbis, &ch, &outs);
+        if (got > 0)
+            break;
+    }
     if (got <= 0)
         return 0;
+    if (got > DECODE_CHUNK)
+        got = DECODE_CHUNK;
+    wasapi_downmix_frame(outs, ch, got, s->decode_buf);
     s->decode_buf_pos = 0;
     s->decode_buf_len = got;
     return got;
@@ -83,7 +120,7 @@ static int wasapi_decode_more(WasapiState *s)
 static void wasapi_read_frame(WasapiState *s, float *l, float *r)
 {
     int idx;
-    short *buf;
+    float *buf;
 
     *l = 0.0f;
     *r = 0.0f;
@@ -105,8 +142,8 @@ static void wasapi_read_frame(WasapiState *s, float *l, float *r)
 
     buf = s->decode_buf;
     idx = s->decode_buf_pos * 2;
-    *l = (float)buf[idx + 0] / 32768.0f;
-    *r = (float)buf[idx + 1] / 32768.0f;
+    *l = buf[idx + 0];
+    *r = buf[idx + 1];
 }
 
 static void wasapi_fill(BYTE *dst, UINT32 frames)
@@ -261,8 +298,8 @@ int audio_wasapi_init(HWND hwnd)
     s->lock_ready = 1;
     s->vol = 0;
     s->mix_float = (s->mixfmt->wBitsPerSample == 32) ? 1 : 0;
-    s->decode_buf = (short *)malloc(DECODE_CHUNK * 8 * sizeof(short));
-    s->decode_buf_cap = DECODE_CHUNK * 8;
+    s->decode_buf = (float *)malloc(DECODE_CHUNK * 2 * sizeof(float));
+    s->decode_buf_cap = DECODE_CHUNK * 2;
     if (!s->decode_buf)
         goto fail;
     s->run = 1;
@@ -373,7 +410,7 @@ int audio_wasapi_play_ogg(const BYTE *ogg_data, DWORD ogg_len, int loop, LONG vo
     /* We always decode to stereo, so buffer only needs DECODE_CHUNK*2. */
     need = DECODE_CHUNK * 2;
     if (need > s->decode_buf_cap) {
-        short *nb = (short *)realloc(s->decode_buf, (size_t)need * sizeof(short));
+        float *nb = (float *)realloc(s->decode_buf, (size_t)need * sizeof(float));
         if (!nb) {
             LeaveCriticalSection(&s->lock);
             stb_vorbis_close(v);
