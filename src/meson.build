@@ -168,3 +168,11 @@ shared_library('winmm',
     cc.find_library('user32'),
   ],
 )
+
+# Standalone local probe tool for debugging OGG decode paths outside the game.
+executable('ogg_probe',
+  'ogg_probe.c',
+  c_args : ['-DSTB_VORBIS_NO_STDIO', '-Wno-unused-parameter', '-Wno-unused-value', '-Wno-maybe-uninitialized'],
+  include_directories : src_inc,
+  dependencies : cc.find_library('m', required : false),
+)
