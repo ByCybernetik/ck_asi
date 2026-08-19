@@ -102,7 +102,7 @@ int decode_to_pcm(const BYTE *raw, DWORD raw_len, WAVEFORMATEX *fmt, BYTE **pcm_
             return 0;
         }
         vfi = stb_vorbis_get_info(vf);
-        if (vfi.channels < 1 || vfi.sample_rate < 1) {
+        if (vfi.channels < 1 || vfi.channels > 2 || vfi.sample_rate < 1) {
             stb_vorbis_close(vf);
             return 0;
         }
@@ -155,7 +155,7 @@ int decode_to_pcm(const BYTE *raw, DWORD raw_len, WAVEFORMATEX *fmt, BYTE **pcm_
     if (!v)
         return 0;
     vi = stb_vorbis_get_info(v);
-    if (vi.channels < 1 || vi.sample_rate < 1) {
+    if (vi.channels < 1 || vi.channels > 2 || vi.sample_rate < 1) {
         stb_vorbis_close(v);
         return 0;
     }

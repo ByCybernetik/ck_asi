@@ -356,7 +356,7 @@ int audio_wasapi_play_ogg(const BYTE *ogg_data, DWORD ogg_len, int loop, LONG vo
         return 0;
     }
     vi = stb_vorbis_get_info(v);
-    if (vi.channels < 1 || vi.sample_rate < 1) {
+    if (vi.channels < 1 || vi.channels > 2 || vi.sample_rate < 1) {
         stb_vorbis_close(v);
         free(copy);
         return 0;

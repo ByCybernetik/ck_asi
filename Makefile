@@ -97,7 +97,8 @@ $(ASI): $(ASI_OBJS)
 	fi
 
 $(SRCDIR)/stb_vorbis.o: $(SRCDIR)/stb_vorbis.c
-	$(CC) $(CFLAGS) -DSTB_VORBIS_NO_STDIO -Wno-unused-parameter -Wno-unused-value \
+	$(CC) $(CFLAGS) -DSTB_VORBIS_NO_STDIO -DSTB_VORBIS_MAX_CHANNELS=2 \
+		-Wno-unused-parameter -Wno-unused-value \
 		-Wno-maybe-uninitialized -c -o $@ $<
 
 $(SRCDIR)/tip_font.o: $(SRCDIR)/tip_font.c $(SRCDIR)/tip_font.h
