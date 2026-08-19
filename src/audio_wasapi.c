@@ -288,14 +288,23 @@ fail:
 void audio_wasapi_shutdown(void)
 {
     WasapiState *s = &g_wasapi;
+    /* Stop worker thread and wait until it exits before freeing stb_vorbis
+     * and decode buffers. A short timeout previously caused a race where
+     * the thread could still be in stb_vorbis (NULL output buffer → movw (%edx)). */
     if (s->run) {
+        if (s->lock_ready)
+            EnterCriticalSection(&s->lock);
+        s->active = 0;
         s->run = 0;
+        if (s->lock_ready)
+            LeaveCriticalSection(&s->lock);
         if (s->ev)
             SetEvent(s->ev);
     }
     if (s->thread) {
-        WaitForSingleObject(s->thread, 500);
+        WaitForSingleObject(s->thread, INFINITE);
         CloseHandle(s->thread);
+        s->thread = NULL;
     }
     if (s->lock_ready)
         EnterCriticalSection(&s->lock);

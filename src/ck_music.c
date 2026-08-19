@@ -264,12 +264,24 @@ int ck_music_init(LPDIRECTSOUND ds)
 void ck_music_shutdown(void)
 {
     CkMusicPlayer *p = &g_mp;
+    /* Stop worker and wait until it exits before freeing decode state.
+     * Previously we used a short timeout and freed/zeroed fields while the
+     * thread could still be inside stb_vorbis → crash in stb_vorbis. */
+    EnterCriticalSection(&p->lock);
+    p->playing = 0;
     p->run = 0;
-    if (p->wake) SetEvent(p->wake);
+    LeaveCriticalSection(&p->lock);
+
+    if (p->wake)
+        SetEvent(p->wake);
+
     if (p->thread) {
-        WaitForSingleObject(p->thread, 1000);
+        WaitForSingleObject(p->thread, INFINITE);
         CloseHandle(p->thread);
+        p->thread = NULL;
     }
+
+    /* From this point worker can't access p->vorbis/p->ogg_data/p->decode_tmp. */
     EnterCriticalSection(&p->lock);
     if (p->vorbis) { stb_vorbis_close(p->vorbis); p->vorbis = NULL; }
     free(p->ogg_data); p->ogg_data = NULL;
