@@ -135,12 +135,17 @@ win_libs += cc.find_library('m')
 
 # --- CK.asi (shared library) --------------------------------------------
 
+asi_inc = [src_inc]
+if gpu_scene
+  asi_inc += vk_inc
+endif
+
 shared_library('CK',
   asi_normal_src,
   name_prefix : '',
   name_suffix : 'asi',
   c_args : win_defs_xp + c_warn,
-  include_directories : src_inc,
+  include_directories : asi_inc,
   link_with : special_libs,
   dependencies : win_libs + [ft_dep],
   link_args : ['-Wl,--kill-at', '-Wl,--enable-stdcall-fix'],
