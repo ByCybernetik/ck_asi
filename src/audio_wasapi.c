@@ -246,6 +246,7 @@ int audio_wasapi_init(HWND hwnd)
     s->decode_buf = (short *)malloc(DECODE_CHUNK * 2 * sizeof(short));
     if (!s->decode_buf)
         goto fail;
+    s->decode_buf_samples = DECODE_CHUNK * 2;
     s->run = 1;
     s->thread = CreateThread(NULL, 0, wasapi_thread_proc, s, 0, NULL);
     if (!s->thread)
@@ -330,6 +331,19 @@ int audio_wasapi_play_ogg(BYTE *ogg_data, DWORD ogg_len, int loop, LONG vol, DWO
     }
 
     EnterCriticalSection(&s->lock);
+    {
+        int need_samples = DECODE_CHUNK * ((vi.channels > 0) ? vi.channels : 2);
+        if (need_samples > s->decode_buf_samples) {
+            short *nb = (short *)realloc(s->decode_buf, (size_t)need_samples * sizeof(short));
+            if (!nb) {
+                LeaveCriticalSection(&s->lock);
+                stb_vorbis_close(v);
+                return 0;
+            }
+            s->decode_buf = nb;
+            s->decode_buf_samples = need_samples;
+        }
+    }
     if (s->vorbis)
         stb_vorbis_close(s->vorbis);
     free(s->ogg_data);
