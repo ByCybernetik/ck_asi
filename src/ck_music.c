@@ -114,7 +114,9 @@ static void ckm_fill_half(CkMusicPlayer *p, BYTE *dst, DWORD bytes)
     short *out = (short *)dst;
     DWORD frames = bytes / CKM_BLOCK;
     DWORD f;
-    float gain = dsvol_linear(p->vol);
+    float gain;
+    if (!out || !bytes || !p->decode_tmp) return;
+    gain = dsvol_linear(p->vol);
     double step = (p->src_rate > 0)
                   ? (double)p->src_rate / (double)CKM_OUT_HZ
                   : 1.0;
@@ -166,15 +168,17 @@ static DWORD WINAPI ckm_thread(void *arg)
             EnterCriticalSection(&p->lock);
             hr = IDirectSoundBuffer_Lock(p->buf, lock_off, CKM_HALF_BYTES,
                                          &ptr1, &len1, &ptr2, &len2, 0);
-            if (SUCCEEDED(hr)) {
-                if (p->playing && p->vorbis) {
+            if (SUCCEEDED(hr) && ptr1 && len1) {
+                if (p->playing && p->vorbis && p->decode_tmp) {
                     ckm_fill_half(p, (BYTE *)ptr1, len1);
                     if (ptr2 && len2)
                         ckm_fill_half(p, (BYTE *)ptr2, len2);
                 } else {
                     memset(ptr1, 0, len1);
-                    if (ptr2) memset(ptr2, 0, len2);
+                    if (ptr2 && len2) memset(ptr2, 0, len2);
                 }
+                IDirectSoundBuffer_Unlock(p->buf, ptr1, len1, ptr2, len2);
+            } else if (SUCCEEDED(hr)) {
                 IDirectSoundBuffer_Unlock(p->buf, ptr1, len1, ptr2, len2);
             }
 
