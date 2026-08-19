@@ -34,6 +34,8 @@ typedef struct {
     volatile LONG active;
 
     stb_vorbis *vorbis;
+    BYTE *ogg_data;
+    DWORD ogg_len;
     int vorbis_ch;
     int vorbis_rate;
     int loop;
@@ -278,6 +280,9 @@ void audio_wasapi_shutdown(void)
         stb_vorbis_close(s->vorbis);
         s->vorbis = NULL;
     }
+    free(s->ogg_data);
+    s->ogg_data = NULL;
+    s->ogg_len = 0;
     if (s->lock_ready)
         LeaveCriticalSection(&s->lock);
     if (s->render)
@@ -296,12 +301,14 @@ void audio_wasapi_shutdown(void)
     memset(s, 0, sizeof(*s));
 }
 
-int audio_wasapi_play_ogg(const BYTE *ogg_data, DWORD ogg_len, int loop, LONG vol)
+int audio_wasapi_play_ogg(BYTE *ogg_data, DWORD ogg_len, int loop, LONG vol, DWORD *duration_ms_out)
 {
     WasapiState *s = &g_wasapi;
     stb_vorbis *v;
     stb_vorbis_info vi;
+    float dur_sec;
     int err = 0;
+    extern float stb_vorbis_stream_length_in_seconds(stb_vorbis *f);
 
     if (!s->thread || !ogg_data || !ogg_len)
         return 0;
@@ -314,11 +321,21 @@ int audio_wasapi_play_ogg(const BYTE *ogg_data, DWORD ogg_len, int loop, LONG vo
         stb_vorbis_close(v);
         return 0;
     }
+    dur_sec = stb_vorbis_stream_length_in_seconds(v);
+    if (duration_ms_out) {
+        if (dur_sec > 0.01f)
+            *duration_ms_out = (DWORD)(dur_sec * 1000.0f);
+        else
+            *duration_ms_out = 0;
+    }
 
     EnterCriticalSection(&s->lock);
     if (s->vorbis)
         stb_vorbis_close(s->vorbis);
+    free(s->ogg_data);
     s->vorbis = v;
+    s->ogg_data = ogg_data;
+    s->ogg_len = ogg_len;
     s->vorbis_ch = vi.channels;
     s->vorbis_rate = (int)vi.sample_rate;
     s->loop = loop ? 1 : 0;
@@ -341,6 +358,9 @@ void audio_wasapi_stop(void)
         stb_vorbis_close(s->vorbis);
         s->vorbis = NULL;
     }
+    free(s->ogg_data);
+    s->ogg_data = NULL;
+    s->ogg_len = 0;
     LeaveCriticalSection(&s->lock);
 }
 

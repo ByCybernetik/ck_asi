@@ -272,7 +272,7 @@ int music_cache_build_ds_for_path(LPDIRECTSOUND ds, const char *path);
 int music_cache_try_acquire_ds_buf(const char *path, LPDIRECTSOUNDBUFFER *out);
 int audio_wasapi_init(HWND hwnd);
 void audio_wasapi_shutdown(void);
-int audio_wasapi_play_ogg(const BYTE *ogg_data, DWORD ogg_len, int loop, LONG vol);
+int audio_wasapi_play_ogg(BYTE *ogg_data, DWORD ogg_len, int loop, LONG vol, DWORD *duration_ms_out);
 void audio_wasapi_stop(void);
 int audio_wasapi_is_playing(void);
 void audio_wasapi_set_volume(LONG vol);

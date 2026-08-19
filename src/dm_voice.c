@@ -1484,9 +1484,9 @@ static HRESULT play_pcm_music_wasapi(CkPerf *perf, CkSegment *seg, CkPath *apath
     CkSegment *old_seg;
     BYTE *raw = NULL;
     DWORD raw_len = 0;
+    DWORD dur_ms = 0;
     int fade_transition = (flags & CK_PLAY_FADE_TRANSITION) != 0;
     int loop_play = seg->repeats == (DWORD)-1;
-    DWORD dur_ms;
 
     if (FAILED(load_wav_file_or_pak(seg->path, &raw, &raw_len)) || !raw || raw_len < 4) {
         free(raw);
@@ -1496,11 +1496,10 @@ static HRESULT play_pcm_music_wasapi(CkPerf *perf, CkSegment *seg, CkPath *apath
         free(raw);
         return E_FAIL;
     }
-    if (!audio_wasapi_play_ogg(raw, raw_len, loop_play, pvol)) {
+    if (!audio_wasapi_play_ogg(raw, raw_len, loop_play, pvol, &dur_ms)) {
         free(raw);
         return E_FAIL;
     }
-    free(raw);
 
     EnterCriticalSection(&perf->lock);
     old_buf = perf->music_buf;
@@ -1512,10 +1511,15 @@ static HRESULT play_pcm_music_wasapi(CkPerf *perf, CkSegment *seg, CkPath *apath
     LeaveCriticalSection(&perf->lock);
     music_release_old(old_buf, old_seg, fade_transition, pvol);
 
-    dur_ms = seg->fmt.nAvgBytesPerSec
-                 ? (DWORD)((ULONGLONG)seg->pcm_bytes * 1000ull / seg->fmt.nAvgBytesPerSec)
-                 : 1000u;
-    if (dur_ms < 1000u) dur_ms = 180000u;
+    if (dur_ms < 1000u)
+        dur_ms = 180000u;
+    seg->fmt.wFormatTag = WAVE_FORMAT_PCM;
+    seg->fmt.nChannels = 2;
+    seg->fmt.nSamplesPerSec = 1000;
+    seg->fmt.wBitsPerSample = 16;
+    seg->fmt.nBlockAlign = 2;
+    seg->fmt.nAvgBytesPerSec = 1000;
+    seg->pcm_bytes = dur_ms;
     music_note_started(seg->path, loop_play, dur_ms, pvol, 0);
     return S_OK;
 }
