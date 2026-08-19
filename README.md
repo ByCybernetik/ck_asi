@@ -28,7 +28,29 @@ make GPU_SCENE=0    # without GPU scene modules
 make install        # → ../Imperivm/scripts/CK.asi + ../Imperivm/winmm.dll
 ```
 
-Needs `i686-w64-mingw32-gcc` and Vulkan headers (`/usr/include/vulkan`).
+Needs `i686-w64-mingw32-gcc` and the dependencies listed below.
+
+## Third-party dependencies
+
+| Library | Version | License | Usage | Source |
+|---------|---------|---------|-------|--------|
+| [Vulkan Headers](https://github.com/KhronosGroup/Vulkan-Headers) | 1.0+ | Apache-2.0 / MIT | Swapchain present, GPU terrain/decor/obj rendering | System (`/usr/include/vulkan`) |
+| [FreeType](https://freetype.org/) | 2.x | FTL / GPL-2.0 | Tooltip text rendering (`tip_font.c`) | Vendored in `deps/freetype/` |
+| [stb_vorbis](https://github.com/nothings/stb) | 1.22 | Public domain | Ogg Vorbis audio decoding (DirectMusic replacement) | Bundled: `src/stb_vorbis.c` |
+| [stb_truetype](https://github.com/nothings/stb) | 1.26 | Public domain | TrueType font rasterization (zoom map text) | Bundled: `src/stb_truetype.h` |
+| [MinGW-w64](https://www.mingw-w64.org/) | — | Various (ZPL / public domain) | Cross-compiler toolchain + Win32/COM/DirectSound/DirectShow headers | System package |
+
+### Win32 SDK libraries (provided by MinGW)
+
+`kernel32`, `user32`, `gdi32`, `ole32`, `dsound`, `strmiids`, `oleaut32`,
+`winmm`, `ws2_32` — linked at build time from the MinGW sysroot.
+
+### Optional / external (not in repo)
+
+| Dependency | Usage |
+|------------|-------|
+| `menu/native_src` → Imperivm 2 `native/src` | Game UI source (symlink) |
+| `menu/native_tp` → Imperivm 2 `native/third_party` | stb, other TP for menu (symlink) |
 
 ## Layout
 
