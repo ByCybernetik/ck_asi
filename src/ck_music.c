@@ -173,7 +173,12 @@ static void ckm_fill_half(CkMusicPlayer *p, BYTE *dst, DWORD bytes)
             return;
         }
         ckm_read_sample(p, &l, &r);
-        l *= gain; r *= gain;
+        l *= gain;
+        r *= gain;
+        if (l > 1.0f) l = 1.0f;
+        if (l < -1.0f) l = -1.0f;
+        if (r > 1.0f) r = 1.0f;
+        if (r < -1.0f) r = -1.0f;
         out[f * 2]     = (short)(l * 32767.0f);
         out[f * 2 + 1] = (short)(r * 32767.0f);
         p->resample_frac += step;

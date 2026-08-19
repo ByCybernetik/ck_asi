@@ -211,6 +211,10 @@ static void wasapi_fill(BYTE *dst, UINT32 frames)
             }
             l *= gain;
             r *= gain;
+            if (l > 1.0f) l = 1.0f;
+            if (l < -1.0f) l = -1.0f;
+            if (r > 1.0f) r = 1.0f;
+            if (r < -1.0f) r = -1.0f;
             out[f * ch + 0] = (short)(l * 32767.0f);
             if (ch > 1) out[f * ch + 1] = (short)(r * 32767.0f);
             for (c = 2; c < ch; ++c)

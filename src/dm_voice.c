@@ -1494,48 +1494,6 @@ static HRESULT play_pcm_music_start(CkPerf *perf, CkSegment *seg, CkPath *apath,
     return S_OK;
 }
 
-static HRESULT play_pcm_music_wasapi(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags, LONG pvol)
-{
-    LPDIRECTSOUNDBUFFER old_buf;
-    CkSegment *old_seg;
-    BYTE *raw = NULL;
-    DWORD raw_len = 0;
-    DWORD dur_ms = 0;
-    int fade_transition = (flags & CK_PLAY_FADE_TRANSITION) != 0;
-    int loop_play = seg->repeats == (DWORD)-1;
-
-    if (FAILED(load_wav_file_or_pak(seg->path, &raw, &raw_len)) || !raw || raw_len < 4) {
-        free(raw);
-        return E_NOTIMPL;
-    }
-    if (memcmp(raw, "OggS", 4) != 0) {
-        free(raw);
-        return E_NOTIMPL;
-    }
-    if (!audio_wasapi_play_ogg(raw, raw_len, loop_play, pvol, &dur_ms)) {
-        free(raw);
-        return E_NOTIMPL;
-    }
-    free(raw);
-
-    EnterCriticalSection(&perf->lock);
-    old_buf = perf->music_buf;
-    old_seg = perf->music_seg;
-    perf->music_buf = NULL;
-    perf->music_seg = seg;
-    ck_segment_addref(seg);
-    perf->music_path_id = apath ? apath->id : 0;
-    LeaveCriticalSection(&perf->lock);
-    music_release_old(old_buf, old_seg, fade_transition, pvol);
-
-    if (dur_ms < 1000u)
-        dur_ms = seg->fmt.nAvgBytesPerSec
-                     ? (DWORD)((ULONGLONG)seg->pcm_bytes * 1000ull / seg->fmt.nAvgBytesPerSec)
-                     : 180000u;
-    music_note_started(seg->path, loop_play, dur_ms, pvol, 0);
-    return S_OK;
-}
-
 static HRESULT play_pcm_music_sync(CkPerf *perf, CkSegment *seg, DWORD flags, LONG pvol)
 {
     DSBUFFERDESC desc;

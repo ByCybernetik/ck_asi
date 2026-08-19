@@ -631,6 +631,7 @@ int music_cache_build_ds_for_path(LPDIRECTSOUND ds, const char *path)
                 LeaveCriticalSection(&g_music_cs);
                 return 0;
             }
+            InterlockedIncrement(&g_music_cache[i].refs);
             pcm = g_music_cache[i].pcm;
             pcm_bytes = g_music_cache[i].pcm_bytes;
             fmt = g_music_cache[i].fmt;
@@ -658,6 +659,8 @@ build:
                 IDirectSoundBuffer_Release(built);
             ok = g_music_cache[i].ds_buf != NULL;
             InterlockedExchange(&g_music_cache[i].ds_building, 0);
+            if (g_music_cache[i].refs > 0)
+                InterlockedDecrement(&g_music_cache[i].refs);
             break;
         }
     }
