@@ -592,6 +592,8 @@ static int music_cache_build_ds_unlocked(MusicCacheEnt *ent, LPDIRECTSOUND ds,
     desc.lpwfxFormat = &ent->fmt;
     hr = IDirectSound_CreateSoundBuffer(ds, &desc, &buf, NULL);
     if (SUCCEEDED(hr) && buf) {
+        log_msg("dm-replace: music cache DS write path=%s pcm=%p bytes=%lu", ent->path, (void *)ent->pcm,
+                (unsigned long)ent->pcm_bytes);
         if (!ds_buf_write_all(buf, ent->pcm, ent->pcm_bytes)) {
             IDirectSoundBuffer_Release(buf);
             buf = NULL;

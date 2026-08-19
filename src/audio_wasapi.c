@@ -103,7 +103,9 @@ static int wasapi_decode_more(WasapiState *s)
     if (!s->vorbis)
         return 0;
     for (tries = 0; tries < 8; ++tries) {
+        log_msg("dm-replace: WASAPI get_frame_float enter vorbis=%p", (void *)s->vorbis);
         got = stb_vorbis_get_frame_float(s->vorbis, &ch, &outs);
+        log_msg("dm-replace: WASAPI get_frame_float exit got=%d ch=%d outs=%p", got, ch, (void *)outs);
         if (got > 0)
             break;
     }

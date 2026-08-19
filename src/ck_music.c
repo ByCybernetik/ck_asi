@@ -110,13 +110,10 @@ static int ckm_decode_more(CkMusicPlayer *p)
     int got = 0, ch = 0, tries;
     float **outs = NULL;
     if (!p->vorbis) return 0;
-    /*
-     * Avoid stb_vorbis short/interleaved conversion path for multichannel
-     * files; known implementations in the wild prefer float decode + external
-     * downmix for robustness.
-     */
     for (tries = 0; tries < 8; ++tries) {
+        log_msg("ck_music: get_frame_float enter vorbis=%p pos=%d len=%d", (void *)p->vorbis, p->decode_pos, p->decode_len);
         got = stb_vorbis_get_frame_float(p->vorbis, &ch, &outs);
+        log_msg("ck_music: get_frame_float exit got=%d ch=%d outs=%p", got, ch, (void *)outs);
         if (got > 0)
             break;
     }
@@ -214,6 +211,9 @@ static DWORD WINAPI ckm_thread(void *arg)
             EnterCriticalSection(&p->lock);
             hr = IDirectSoundBuffer_Lock(p->buf, lock_off, CKM_HALF_BYTES,
                                          &ptr1, &len1, &ptr2, &len2, 0);
+            log_msg("ck_music: DS lock hr=0x%08lx off=%lu req=%u p1=%p n1=%lu p2=%p n2=%lu playing=%ld",
+                    (unsigned long)hr, (unsigned long)lock_off, (unsigned)CKM_HALF_BYTES,
+                    ptr1, (unsigned long)len1, ptr2, (unsigned long)len2, (long)p->playing);
             if (SUCCEEDED(hr) && ptr1 && len1) {
                 if (p->playing && p->vorbis && p->decode_tmp) {
                     ckm_fill_half(p, (BYTE *)ptr1, len1);
@@ -224,8 +224,10 @@ static DWORD WINAPI ckm_thread(void *arg)
                     if (ptr2 && len2) memset(ptr2, 0, len2);
                 }
                 IDirectSoundBuffer_Unlock(p->buf, ptr1, len1, ptr2, len2);
+                log_msg("ck_music: DS unlock done");
             } else if (SUCCEEDED(hr)) {
                 IDirectSoundBuffer_Unlock(p->buf, ptr1, len1, ptr2, len2);
+                log_msg("ck_music: DS unlock empty-lock done");
             }
 
             if (was_playing && !p->playing) {
@@ -313,6 +315,7 @@ void ck_music_shutdown(void)
     /* Stop worker and wait until it exits before freeing decode state.
      * Previously we used a short timeout and freed/zeroed fields while the
      * thread could still be inside stb_vorbis → crash in stb_vorbis. */
+    log_msg("ck_music: shutdown enter thread=%p playing=%ld", (void *)p->thread, (long)p->playing);
     EnterCriticalSection(&p->lock);
     p->playing = 0;
     p->run = 0;
@@ -337,6 +340,7 @@ void ck_music_shutdown(void)
     if (p->wake) CloseHandle(p->wake);
     DeleteCriticalSection(&p->lock);
     memset(p, 0, sizeof(*p));
+    log_msg("ck_music: shutdown done");
 }
 
 int ck_music_play(const char *path, int loop, LONG vol_mb)
