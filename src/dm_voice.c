@@ -496,6 +496,7 @@ void live_cs_leave(void)
 void live_free_slot(int i)
 {
     LPDIRECTSOUNDBUFFER b, bR;
+    CkSegment *seg;
 
     live_cs_enter();
     if (i < 0 || i >= s_live_n) {
@@ -504,6 +505,7 @@ void live_free_slot(int i)
     }
     b = s_live[i].b;
     bR = s_live[i].bR;
+    seg = s_live[i].seg;
     s_live[i].b = NULL;
     s_live[i].bR = NULL;
     s_live[i].spatial = 0;
@@ -519,6 +521,8 @@ void live_free_slot(int i)
         IDirectSoundBuffer_Stop(bR);
         IDirectSoundBuffer_Release(bR);
     }
+    if (seg)
+        ck_segment_release(seg);
 }
 
 void spatial_apply_live(CkLiveBuf *lb, int force)
@@ -578,6 +582,7 @@ static void spatial_tick_live(void)
 {
     int i;
     DWORD now = GetTickCount();
+    live_cs_enter();
     for (i = 0; i < s_live_n;) {
         if ((LONG)(now - s_live[i].done_tick) >= 0) {
             live_free_slot(i);
@@ -587,6 +592,7 @@ static void spatial_tick_live(void)
             spatial_apply_live(&s_live[i], 0);
         i++;
     }
+    live_cs_leave();
 }
 
 /* Dual L/R + camera spatial. loop=1 for long ambient beds; voices/buildings stay one-shot. */
@@ -603,9 +609,6 @@ int spatial_voice_play(CkPerf *perf, CkSegment *seg, CkPath *apath, int loop)
         return 0;
     if (seg->fmt.wBitsPerSample != 16)
         return 0;
-    if (s_live_n >= (int)(sizeof(s_live) / sizeof(s_live[0])))
-        return 0;
-
     stereo_wfx_from(&seg->fmt, &wfx);
     if (seg->fmt.nChannels == 1)
         stereo_bytes = (seg->pcm_bytes / 2u) * 4u;
@@ -648,6 +651,9 @@ int spatial_voice_play(CkPerf *perf, CkSegment *seg, CkPath *apath, int loop)
         dur_ms = 50u;
     dur_ms += 400u;
 
+    live_cs_enter();
+    if (s_live_n >= (int)(sizeof(s_live) / sizeof(s_live[0])))
+        live_free_slot(0);
     lb = &s_live[s_live_n];
     memset(lb, 0, sizeof(*lb));
     lb->b = bL;
@@ -655,6 +661,7 @@ int spatial_voice_play(CkPerf *perf, CkSegment *seg, CkPath *apath, int loop)
     lb->done_tick = loop ? (GetTickCount() + 3600000u) : (GetTickCount() + dur_ms);
     lb->path_id = apath ? apath->id : 0;
     lb->seg = seg;
+    ck_segment_addref(seg);
     lb->spatial = 1;
     lb->looping = loop ? 1 : 0;
     lb->base_vol = base_vol;
@@ -682,6 +689,7 @@ int spatial_voice_play(CkPerf *perf, CkSegment *seg, CkPath *apath, int loop)
     lb->ref_span = 0;
     s_live_n++;
     spatial_apply_live(lb, 1);
+    live_cs_leave();
     return 1;
 }
 
@@ -814,8 +822,13 @@ void path_propagate_volume(CkPath *path)
     vol = path_clamp_vol(path->vol);
     if (path->ctrl)
         IDirectSoundBuffer_SetVolume(path->ctrl, vol);
-    if (path->id == 1 && g_active_perf && g_active_perf->music_buf)
-        IDirectSoundBuffer_SetVolume(g_active_perf->music_buf, vol);
+    if (g_active_perf) {
+        CkPerf *perf = g_active_perf;
+        EnterCriticalSection(&perf->lock);
+        if (path->id == perf->music_path_id && perf->music_buf)
+            IDirectSoundBuffer_SetVolume(perf->music_buf, vol);
+        LeaveCriticalSection(&perf->lock);
+    }
     live_cs_enter();
     for (i = 0; i < s_live_n; i++) {
         if (s_live[i].path_id != path->id)
@@ -1041,7 +1054,7 @@ static int music_play_rel(CkPerf *perf, const char *fname)
         return 0;
     snprintf(rel, sizeof(rel), "music\\%s", fname);
     memset(&fmt, 0, sizeof(fmt));
-    if (music_cache_get(rel, &fmt, &pcm, &pcm_len)) {
+    if (music_cache_acquire(rel, &fmt, &pcm, &pcm_len)) {
         cached = 1;
     } else {
         LONGLONG t0 = hitch_qpc_now();
@@ -1055,7 +1068,7 @@ static int music_play_rel(CkPerf *perf, const char *fname)
         }
         free(raw);
         pcm = music_cache_intern(rel, &fmt, pcm, pcm_len);
-        cached = music_cache_get(rel, &fmt, &pcm, &pcm_len);
+        cached = music_cache_acquire(rel, &fmt, &pcm, &pcm_len);
         log_msg("dm-replace: random music decode '%s' ms=%.1f cached=%d pcm=%lu", rel,
                 hitch_qpc_ms_since(t0), cached, (unsigned long)pcm_len);
     }
@@ -1077,6 +1090,8 @@ static int music_play_rel(CkPerf *perf, const char *fname)
             path_apply_buf_vol(buf, g_music_vol);
     }
     LeaveCriticalSection(&perf->lock);
+    if (cached)
+        music_cache_release(rel, pcm);
     /* Shared music-cache buffers must not be freed. */
     if (!cached && pcm)
         free(pcm);
@@ -1085,11 +1100,17 @@ static int music_play_rel(CkPerf *perf, const char *fname)
             IDirectSoundBuffer_Release(buf);
         return 0;
     }
+    EnterCriticalSection(&perf->lock);
     if (perf->music_buf) {
         IDirectSoundBuffer_Stop(perf->music_buf);
         IDirectSoundBuffer_Release(perf->music_buf);
     }
+    if (perf->music_seg)
+        ck_segment_release(perf->music_seg);
     perf->music_buf = buf;
+    perf->music_seg = NULL;
+    perf->music_path_id = 0;
+    LeaveCriticalSection(&perf->lock);
     dur_ms = fmt.nAvgBytesPerSec ? (DWORD)((ULONGLONG)pcm_len * 1000ull / fmt.nAvgBytesPerSec) : 1000u;
     music_note_started(rel, 0, dur_ms, g_music_vol);
     log_msg("dm-replace: random music '%s' (%lu ms)%s", rel, (unsigned long)dur_ms,
@@ -1124,8 +1145,14 @@ static void music_play_random_next(CkPerf *perf)
 static void music_tick(void)
 {
     CkPerf *p = g_active_perf;
-    if (!g_music_auto || g_music_looping || !p || !p->music_buf)
+    if (!g_music_auto || g_music_looping || !p)
         return;
+    EnterCriticalSection(&p->lock);
+    if (!p->music_buf) {
+        LeaveCriticalSection(&p->lock);
+        return;
+    }
+    LeaveCriticalSection(&p->lock);
     if ((LONG)(GetTickCount() - g_music_done_tick) < 0)
         return;
     /* Track finished — pick next like CVXMusicPlayer::PlayRandomMusic. */
@@ -1136,12 +1163,24 @@ static void music_tick(void)
 void stop_music_buf(void)
 {
     CkPerf *p = g_active_perf;
+    LPDIRECTSOUNDBUFFER buf;
+    CkSegment *seg;
     music_clear_state();
-    if (!p || !p->music_buf)
+    if (!p)
         return;
-    IDirectSoundBuffer_Stop(p->music_buf);
-    IDirectSoundBuffer_Release(p->music_buf);
+    EnterCriticalSection(&p->lock);
+    buf = p->music_buf;
+    seg = p->music_seg;
     p->music_buf = NULL;
+    p->music_seg = NULL;
+    p->music_path_id = 0;
+    LeaveCriticalSection(&p->lock);
+    if (buf) {
+        IDirectSoundBuffer_Stop(buf);
+        IDirectSoundBuffer_Release(buf);
+    }
+    if (seg)
+        ck_segment_release(seg);
 }
 
 void dm_replace_silence_music(void)
@@ -1155,19 +1194,47 @@ void stop_live_for_segment(CkSegment *seg)
     int i;
     if (!seg)
         return;
+    live_cs_enter();
     for (i = 0; i < s_live_n;) {
         if (s_live[i].seg == seg)
             live_free_slot(i);
         else
             i++;
     }
+    live_cs_leave();
 }
 
 /* H55/H56: mission→menu or CloseDown — silence all secondary SFX. */
 void stop_all_live_sfx(void)
 {
+    live_cs_enter();
     while (s_live_n > 0)
         live_free_slot(0);
+    live_cs_leave();
+}
+
+int segment_is_playing(CkSegment *seg)
+{
+    int i, playing = 0;
+    CkPerf *perf = g_active_perf;
+    if (!seg)
+        return 0;
+    if (perf) {
+        EnterCriticalSection(&perf->lock);
+        playing = perf->music_buf && perf->music_seg == seg;
+        LeaveCriticalSection(&perf->lock);
+    }
+    if (playing)
+        return 1;
+    live_cs_enter();
+    for (i = 0; i < s_live_n; ++i) {
+        if (s_live[i].seg == seg) {
+            playing = 1;
+            break;
+        }
+    }
+    live_cs_leave();
+    return playing;
 }
 
 /* Stop prior SFX on this audiopath — native channel re-triggers (H47). */
@@ -1176,12 +1243,14 @@ void path_stop_live_sfx(DWORD path_id)
     int i;
     if (!path_id)
         return;
+    live_cs_enter();
     for (i = 0; i < s_live_n;) {
         if (s_live[i].path_id == path_id)
             live_free_slot(i);
         else
             i++;
     }
+    live_cs_leave();
 }
 
 HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
@@ -1206,6 +1275,8 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
 
     if (!apath && seg->last_path)
         apath = (CkPath *)seg->last_path;
+    if (apath && !apath->active)
+        return S_FALSE;
 
     /* flags=0 → default/music path; flags=0x80 → secondary SFX channel (DIRECTMUSIC.md) */
     is_music = !(flags & 0x80u) && path_is_music(seg->path);
@@ -1216,12 +1287,14 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
         path_stop_live_sfx(apath->id);
     now = GetTickCount();
     /* H36: Wine GetStatus lies on STATIC buffers → free only by done_tick + margin */
+    live_cs_enter();
     for (i = 0; i < s_live_n;) {
         if ((LONG)(now - s_live[i].done_tick) >= 0) {
             live_free_slot(i);
         } else
             i++;
     }
+    live_cs_leave();
 
     play_bytes = seg->pcm_bytes;
     dur_ms = seg->fmt.nAvgBytesPerSec
@@ -1319,19 +1392,29 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
 
     if (SUCCEEDED(hr) && buf) {
         if (is_music) {
+            EnterCriticalSection(&perf->lock);
             if (perf->music_buf) {
                 IDirectSoundBuffer_Stop(perf->music_buf);
                 IDirectSoundBuffer_Release(perf->music_buf);
             }
+            if (perf->music_seg)
+                ck_segment_release(perf->music_seg);
             perf->music_buf = buf;
+            perf->music_seg = seg;
+            ck_segment_addref(seg);
+            perf->music_path_id = apath ? apath->id : 0;
             buf = NULL;
+            LeaveCriticalSection(&perf->lock);
             {
                 DWORD md = seg->fmt.nAvgBytesPerSec
                                ? (DWORD)((ULONGLONG)seg->pcm_bytes * 1000ull / seg->fmt.nAvgBytesPerSec)
                                : 1000u;
                 music_note_started(seg->path, loop_play, md, pvol);
             }
-        } else if (s_live_n < (int)(sizeof(s_live) / sizeof(s_live[0]))) {
+        } else {
+            live_cs_enter();
+            if (s_live_n >= (int)(sizeof(s_live) / sizeof(s_live[0])))
+                live_free_slot(0);
             memset(&s_live[s_live_n], 0, sizeof(s_live[0]));
             s_live[s_live_n].b = buf;
             s_live[s_live_n].bR = NULL;
@@ -1339,15 +1422,14 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
                 loop_play ? (GetTickCount() + 3600000u) : (GetTickCount() + dur_ms);
             s_live[s_live_n].path_id = apath ? apath->id : 0;
             s_live[s_live_n].seg = seg;
+            ck_segment_addref(seg);
             s_live[s_live_n].spatial = 0;
             s_live[s_live_n].looping = loop_play ? 1 : 0;
             s_live[s_live_n].base_vol = pvol;
             s_live[s_live_n].last_pan = use_softpan ? ppan : 0x7fffffff;
             s_live_n++;
             buf = NULL;
-        } else {
-            IDirectSoundBuffer_Release(buf);
-            buf = NULL;
+            live_cs_leave();
         }
     } else if (buf) {
         IDirectSoundBuffer_Release(buf);

@@ -1,5 +1,22 @@
 #include "dm_replace_internal.h"
 
+static ULONG STDMETHODCALLTYPE state_Release(CkState *This);
+
+static void notif_clear_all(CkPerf *perf)
+{
+    int i;
+    if (!perf)
+        return;
+    EnterCriticalSection(&perf->lock);
+    for (i = 0; i < CK_NOTIF_SLOTS; ++i) {
+        CkState *state = perf->notif[i].state;
+        memset(&perf->notif[i], 0, sizeof(perf->notif[i]));
+        if (state)
+            state_Release(state);
+    }
+    LeaveCriticalSection(&perf->lock);
+}
+
 void notif_schedule_segend(CkPerf *perf, CkState *st, DWORD dur_ms)
 {
     int i;
@@ -18,11 +35,23 @@ void notif_schedule_segend(CkPerf *perf, CkState *st, DWORD dur_ms)
             break;
     }
     if (i >= CK_NOTIF_SLOTS) {
-        LeaveCriticalSection(&perf->lock);
-        /* #region agent log */
-        dm_agent("H48", "dm_replace.c:notif", "notif-full", "{\"drop\":1}");
-        /* #endregion */
-        return;
+        int oldest = -1;
+        for (i = 0; i < CK_NOTIF_SLOTS; ++i) {
+            if (perf->notif[i].phase == 1 &&
+                (oldest < 0 ||
+                 (LONG)(perf->notif[i].fire_ms - perf->notif[oldest].fire_ms) < 0))
+                oldest = i;
+        }
+        if (oldest < 0) {
+            LeaveCriticalSection(&perf->lock);
+            dm_agent("H48", "dm_replace.c:notif", "notif-full", "{\"drop\":1}");
+            return;
+        }
+        i = oldest;
+        if (perf->notif[i].state)
+            state_Release(perf->notif[i].state);
+        memset(&perf->notif[i], 0, sizeof(perf->notif[i]));
+        dm_agent("H48", "dm_replace.c:notif", "notif-replace-oldest", "{\"drop\":0}");
     }
     s = &perf->notif[i];
     memset(&s->msg, 0, sizeof(s->msg));
@@ -32,7 +61,7 @@ void notif_schedule_segend(CkPerf *perf, CkState *st, DWORD dur_ms)
     s->msg.dwNotificationOption = CK_DMUS_NOTIFICATION_SEGEND;
     s->msg.punkUser = st;
     s->state = st;
-    st->refs++;
+    InterlockedIncrement(&st->refs);
     s->fire_ms = fire;
     s->phase = 1;
     LeaveCriticalSection(&perf->lock);
@@ -109,7 +138,7 @@ static HRESULT STDMETHODCALLTYPE perf_FreePMsg(CkPerf *This, void *pMsg)
         if (&s->msg == pMsg && s->phase == 2) {
             s->phase = 0;
             if (s->state) {
-                InterlockedDecrement(&s->state->refs);
+                state_Release(s->state);
                 s->state = NULL;
             }
             s->msg.punkUser = NULL;
@@ -381,12 +410,12 @@ static HRESULT STDMETHODCALLTYPE stub_false_pmsg(void *This, void **pp)
     return S_FALSE;
 }
 
-static HRESULT STDMETHODCALLTYPE stub_false_playing(void *This, void *a, void *b)
+static HRESULT STDMETHODCALLTYPE perf_IsPlaying(CkPerf *This, CkSegment *seg, CkState *state)
 {
     (void)This;
-    (void)a;
-    (void)b;
-    return S_FALSE;
+    if (!seg && state)
+        seg = state->seg;
+    return segment_is_playing(seg) ? S_OK : S_FALSE;
 }
 
 static HRESULT STDMETHODCALLTYPE perf_GetTime(void *This, LONGLONG *prt, LONG *pmt)
@@ -395,19 +424,19 @@ static HRESULT STDMETHODCALLTYPE perf_GetTime(void *This, LONGLONG *prt, LONG *p
     static DWORD s_last_log;
     LONG n = InterlockedIncrement(&s_n);
     DWORD now = GetTickCount();
-    (void)This;
-    /* Stub returns zeros — suspect busy-wait if game polls until music time advances. */
+    CkPerf *perf = (CkPerf *)This;
+    DWORD elapsed = perf ? now - perf->clock_start_ms : now;
     if (prt)
-        *prt = 0;
+        *prt = (LONGLONG)elapsed * 10000ll;
     if (pmt)
-        *pmt = 0;
+        *pmt = (LONG)(((ULONGLONG)elapsed * 768ull) / 1000ull);
     /* #region agent log */
     if (n <= 30 || (n % 500) == 0 || (now - s_last_log) >= 250u) {
         char js[160];
         s_last_log = now;
         snprintf(js, sizeof(js),
-                 "{\"n\":%ld,\"prt\":0,\"pmt\":0,\"tid\":%lu,\"now\":%lu}", (long)n,
-                 (unsigned long)GetCurrentThreadId(), (unsigned long)now);
+                 "{\"n\":%ld,\"elapsed\":%lu,\"tid\":%lu,\"now\":%lu}", (long)n,
+                 (unsigned long)elapsed, (unsigned long)GetCurrentThreadId(), (unsigned long)now);
         dm_agent("H-GTIME", "dm_com.c:perf_GetTime", "dm-gettime", js);
     }
     /* #endregion */
@@ -488,8 +517,11 @@ static HRESULT STDMETHODCALLTYPE path_SetVolume(CkPath *This, LONG vol, DWORD du
 }
 static HRESULT STDMETHODCALLTYPE path_Activate(CkPath *This, BOOL on)
 {
-    (void)This;
-    (void)on;
+    if (!This)
+        return E_POINTER;
+    This->active = on ? 1 : 0;
+    if (!This->active)
+        path_stop_live_sfx(This->id);
     return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE path_ConvertPChannel(CkPath *This, DWORD in, DWORD *out)
@@ -510,9 +542,14 @@ static int g_dsctrl_vt_ready;
 
 static HRESULT STDMETHODCALLTYPE dsc_QI(CkDsCtrl *This, REFIID riid, void **ppv)
 {
-    (void)riid;
     if (!ppv)
         return E_POINTER;
+    if (!riid || (!IsEqualGUID(riid, &IID_IUnknown) &&
+                  !IsEqualGUID(riid, &IID_IDirectSoundBuffer) &&
+                  !IsEqualGUID(riid, &IID_IDirectSoundBuffer8))) {
+        *ppv = NULL;
+        return E_NOINTERFACE;
+    }
     *ppv = This;
     InterlockedIncrement(&This->refs);
     return S_OK;
@@ -670,6 +707,8 @@ void state_init(CkState *st, CkSegment *seg, DWORD repeats)
     st->refs = 1;
     st->seg = seg;
     st->repeats = repeats;
+    if (seg)
+        ck_segment_addref(seg);
 }
 
 static ULONG STDMETHODCALLTYPE state_AddRef(CkState *This)
@@ -679,8 +718,11 @@ static ULONG STDMETHODCALLTYPE state_AddRef(CkState *This)
 static ULONG STDMETHODCALLTYPE state_Release(CkState *This)
 {
     LONG r = InterlockedDecrement(&This->refs);
-    if (r == 0)
+    if (r == 0) {
+        if (This->seg)
+            ck_segment_release(This->seg);
         free(This);
+    }
     return (ULONG)r;
 }
 static HRESULT STDMETHODCALLTYPE state_QI(CkState *This, REFIID riid, void **ppv)
@@ -736,30 +778,52 @@ static HRESULT STDMETHODCALLTYPE state_GetSegment(CkState *This, void **segment)
 }
 
 /* -------- segment -------- */
-static ULONG STDMETHODCALLTYPE seg_AddRef(CkSegment *This)
+static void segment_destroy(CkSegment *seg)
 {
-    return (ULONG)InterlockedIncrement(&This->refs);
+    if (!seg)
+        return;
+    if (seg->pcm_cached)
+        music_cache_release(seg->path, seg->pcm);
+    else
+        free(seg->pcm);
+    seg->pcm = NULL;
+    free(seg);
 }
-static ULONG STDMETHODCALLTYPE seg_Release(CkSegment *This)
+
+ULONG ck_segment_addref(CkSegment *seg)
 {
-    LONG r = InterlockedDecrement(&This->refs);
+    if (!seg)
+        return 0;
+    return (ULONG)InterlockedIncrement(&seg->refs);
+}
+
+ULONG ck_segment_release(CkSegment *seg)
+{
+    LONG r;
+    if (!seg)
+        return 0;
+    r = InterlockedDecrement(&seg->refs);
     /* #region agent log */
     {
         char js[120];
         ck_ring_push(9, (int)r);
-        snprintf(js, sizeof(js), "{\"refs\":%ld,\"path\":\"%.60s\"}", (long)r, This->path);
+        snprintf(js, sizeof(js), "{\"refs\":%ld,\"path\":\"%.60s\"}", (long)r, seg->path);
         dm_agent("H28", "dm_replace.c:Release", "seg-release", js);
     }
     /* #endregion */
-    /*
-     * Do not free — game touches segment after Release (crash-ctx: write AV @+8, ebp=seg,
-     * path music/Game10.ogg, refs→0). Native DM keeps objects alive longer.
-     */
-    if (r <= 0) {
-        This->refs = 1;
-        return 1;
-    }
+    /* Game may touch a released segment until Unload; defer destruction until then. */
+    if (r <= 0 && seg->unloaded)
+        segment_destroy(seg);
     return (ULONG)r;
+}
+
+static ULONG STDMETHODCALLTYPE seg_AddRef(CkSegment *This)
+{
+    return ck_segment_addref(This);
+}
+static ULONG STDMETHODCALLTYPE seg_Release(CkSegment *This)
+{
+    return ck_segment_release(This);
 }
 static HRESULT STDMETHODCALLTYPE seg_QI(CkSegment *This, REFIID riid, void **ppv)
 {
@@ -895,7 +959,9 @@ static HRESULT STDMETHODCALLTYPE seg_Unload(CkSegment *This, void *pAudioPath)
         /* Only stop BGM — do not wipe s_live (playlist track change Unloads music). */
         stop_music_buf();
     }
-    (void)This;
+    This->unloaded = 1;
+    if (This->refs <= 0)
+        segment_destroy(This);
     return S_OK;
 }
 
@@ -929,11 +995,16 @@ static ULONG STDMETHODCALLTYPE perf_Release(CkPerf *This)
     LONG r = InterlockedDecrement(&This->refs);
     if (r == 0) {
         beacon_stop();
-        if (This->music_buf) {
+        notif_clear_all(This);
+        if (g_active_perf == This) {
+            stop_music_buf();
+            g_active_perf = NULL;
+        } else if (This->music_buf) {
             IDirectSoundBuffer_Stop(This->music_buf);
             IDirectSoundBuffer_Release(This->music_buf);
-            This->music_buf = NULL;
         }
+        if (This->music_seg)
+            ck_segment_release(This->music_seg);
         if (This->primary)
             IDirectSoundBuffer_Release(This->primary);
         if (This->ds)
@@ -965,7 +1036,8 @@ static HRESULT STDMETHODCALLTYPE perf_InitAudio(CkPerf *This, void **ppDM, void 
     WAVEFORMATEX wfx;
     char js[256];
 
-    (void)ppDM;
+    if (ppDM)
+        *ppDM = NULL;
     (void)pathType;
     (void)pchannels;
     (void)params;
@@ -998,9 +1070,14 @@ static HRESULT STDMETHODCALLTYPE perf_InitAudio(CkPerf *This, void **ppDM, void 
         IDirectSoundBuffer_SetFormat(This->primary, &wfx);
 
     if (ppDS)
-        *ppDS = NULL;
+    {
+        *ppDS = This->ds;
+        if (This->ds)
+            IDirectSound_AddRef(This->ds);
+    }
 
     g_active_perf = This;
+    This->clock_start_ms = GetTickCount();
 
     /* Warm music OGG files off the game thread (H-AUD: tpw0 cold decode ~1.5s). */
     music_preload_start();
@@ -1032,6 +1109,7 @@ static HRESULT STDMETHODCALLTYPE perf_CreateStdPath(CkPerf *This, DWORD type, DW
     p->self = p; /* Download wrapper reads *(path+4) */
     p->refs = 1;
     p->id = (DWORD)InterlockedIncrement((LONG *)&g_path_id);
+    p->active = 1;
     *ppPath = p;
     snprintf(js, sizeof(js), "{\"type\":%lu,\"pch\":%lu,\"id\":%lu,\"path\":%lu}", (unsigned long)type,
              (unsigned long)pchannels, (unsigned long)p->id, (unsigned long)(ULONG_PTR)p);
@@ -1150,8 +1228,17 @@ static HRESULT STDMETHODCALLTYPE perf_Stop(CkPerf *This, void *seg, void *state,
     (void)This;
     (void)mt;
     (void)flags;
-    /* Native Stop(NULL,NULL) stops all; we only hold BGM in music_buf. */
-    if (!seg && !state)
+    if (seg)
+        stop_live_for_segment((CkSegment *)seg);
+    else if (state && ((CkState *)state)->seg)
+        stop_live_for_segment(((CkState *)state)->seg);
+    else {
+        stop_all_live_sfx();
+        stop_music_buf();
+    }
+    if ((seg && path_is_music(((CkSegment *)seg)->path)) ||
+        (state && ((CkState *)state)->seg &&
+         path_is_music(((CkState *)state)->seg->path)))
         stop_music_buf();
     return S_OK;
 }
@@ -1161,19 +1248,24 @@ static HRESULT STDMETHODCALLTYPE perf_StopEx(CkPerf *This, void *obj, ULONGLONG 
     (void)This;
     (void)when;
     (void)flags;
-    if (!obj)
+    if (!obj) {
+        stop_all_live_sfx();
         stop_music_buf();
+    } else if (!IsBadReadPtr(obj, sizeof(void *))) {
+        void **vt = *(void ***)obj;
+        CkSegment *seg = vt == g_state_vt ? ((CkState *)obj)->seg : (CkSegment *)obj;
+        stop_live_for_segment(seg);
+        if (seg && path_is_music(seg->path))
+            stop_music_buf();
+    }
     return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE perf_CloseDown(CkPerf *This)
 {
     stop_all_live_sfx();
-    if (This->music_buf) {
-        IDirectSoundBuffer_Stop(This->music_buf);
-        IDirectSoundBuffer_Release(This->music_buf);
-        This->music_buf = NULL;
-    }
+    stop_music_buf();
+    notif_clear_all(This);
     if (This->primary) {
         IDirectSoundBuffer_Release(This->primary);
         This->primary = NULL;
@@ -1182,6 +1274,7 @@ static HRESULT STDMETHODCALLTYPE perf_CloseDown(CkPerf *This)
         IDirectSound_Release(This->ds);
         This->ds = NULL;
     }
+    music_cache_collect();
     if (g_active_perf == This)
         g_active_perf = NULL;
     return S_OK;
@@ -1261,6 +1354,7 @@ static HRESULT STDMETHODCALLTYPE ldr_GetObject(CkLoader *This, void *pDesc, REFI
     LONG n = InterlockedIncrement(&g_get_n);
     char js[280];
     char scraped[260];
+    int pcm_cached = 0;
 
     (void)This;
     (void)riid;
@@ -1292,7 +1386,8 @@ static HRESULT STDMETHODCALLTYPE ldr_GetObject(CkLoader *This, void *pDesc, REFI
     }
 
     /* Music: shared full-PCM cache (H-AUD). SFX: small copy cache. */
-    if (path_is_music(scraped) && music_cache_get(scraped, &fmt, &pcm_buf, &pcm_len)) {
+    if (path_is_music(scraped) && music_cache_acquire(scraped, &fmt, &pcm_buf, &pcm_len)) {
+        pcm_cached = 1;
         /* #region agent log */
         {
             FILE *df = fopen("/home/cybernetik/Games/Imperivm/ck_asi/.cursor/debug-764ba7.log", "a");
@@ -1326,8 +1421,7 @@ static HRESULT STDMETHODCALLTYPE ldr_GetObject(CkLoader *This, void *pDesc, REFI
             return FAILED(hr) ? hr : E_FAIL;
         }
         t_dec = hitch_qpc_now();
-        if (!decode_to_pcm(raw, raw_len, &fmt, &pcm_buf, &pcm_len,
-                           is_music ? OGG_DECODE_FULL : OGG_DECODE_MAX_SEC)) {
+        if (!decode_to_pcm(raw, raw_len, &fmt, &pcm_buf, &pcm_len, OGG_DECODE_FULL)) {
             snprintf(js, sizeof(js), "{\"n\":%ld,\"path\":\"%.120s\",\"raw\":%lu}", (long)n, scraped,
                      (unsigned long)raw_len);
             dm_agent("R2", "dm_replace.c:GetObject", "get-bad-decode", js);
@@ -1341,7 +1435,8 @@ static HRESULT STDMETHODCALLTYPE ldr_GetObject(CkLoader *This, void *pDesc, REFI
         raw = NULL;
         if (is_music) {
             /* Full decode into music cache — DS STATIC buffer must hold the whole track. */
-            pcm_buf = music_cache_intern(scraped, &fmt, pcm_buf, pcm_len);
+            pcm_buf =
+                music_cache_intern_acquire(scraped, &fmt, pcm_buf, pcm_len, &pcm_cached);
         } else
             cache_put(scraped, &fmt, pcm_buf, pcm_len);
         if (n <= 30 || (n % 50) == 0 || is_music || ms_load + ms_dec >= 5.0) {
@@ -1358,7 +1453,10 @@ static HRESULT STDMETHODCALLTYPE ldr_GetObject(CkLoader *This, void *pDesc, REFI
 
     seg = (CkSegment *)calloc(1, sizeof(*seg));
     if (!seg) {
-        free(pcm_buf);
+        if (pcm_cached)
+            music_cache_release(scraped, pcm_buf);
+        else
+            free(pcm_buf);
         return E_OUTOFMEMORY;
     }
     seg->lpVtbl = g_seg_vt;
@@ -1366,6 +1464,7 @@ static HRESULT STDMETHODCALLTYPE ldr_GetObject(CkLoader *This, void *pDesc, REFI
     seg->fmt = fmt;
     seg->pcm_bytes = pcm_len;
     seg->pcm = pcm_buf;
+    seg->pcm_cached = pcm_cached;
     strncpy(seg->path, scraped, sizeof(seg->path) - 1);
     *ppv = seg;
 
@@ -1402,7 +1501,7 @@ void init_vtables(void)
     g_perf_vt[2] = (void *)perf_Release;
     g_perf_vt[4] = (void *)perf_PlaySegment; /* classic PlaySegment */
     g_perf_vt[PERF_IDX_STOP] = (void *)perf_Stop;
-    g_perf_vt[14] = (void *)stub_false_playing; /* IsPlaying */
+    g_perf_vt[14] = (void *)perf_IsPlaying;
     g_perf_vt[15] = (void *)perf_GetTime;
     g_perf_vt[PERF_IDX_SETNOTIF] = (void *)perf_SetNotificationHandle;
     g_perf_vt[PERF_IDX_GETNOTIF] = (void *)perf_GetNotificationPMsg;

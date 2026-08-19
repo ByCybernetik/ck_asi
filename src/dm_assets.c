@@ -52,25 +52,6 @@ static int parse_wav(const BYTE *data, DWORD size, WAVEFORMATEX *fmt, const BYTE
     return (*pcm && *pcm_len && fmt->nChannels && fmt->nSamplesPerSec && fmt->wBitsPerSample) ? 1 : 0;
 }
 
-/* Tiny silent PCM (BGM is FMOD; DM path must not allocate ~44MB Game*.ogg). */
-int make_silent_pcm(WAVEFORMATEX *fmt, BYTE **pcm_out, DWORD *pcm_len)
-{
-    DWORD nbytes = 2205u * 2u; /* ~100ms @ 22050 mono 16-bit */
-    BYTE *b = (BYTE *)calloc(1, nbytes);
-    if (!b)
-        return 0;
-    memset(fmt, 0, sizeof(*fmt));
-    fmt->wFormatTag = WAVE_FORMAT_PCM;
-    fmt->nChannels = 1;
-    fmt->nSamplesPerSec = 22050;
-    fmt->wBitsPerSample = 16;
-    fmt->nBlockAlign = 2;
-    fmt->nAvgBytesPerSec = 44100;
-    *pcm_out = b;
-    *pcm_len = nbytes;
-    return 1;
-}
-
 /* Decode RIFF or Ogg into owned PCM buffer (*pcm_out must free). */
 int decode_to_pcm(const BYTE *raw, DWORD raw_len, WAVEFORMATEX *fmt, BYTE **pcm_out,
                          DWORD *pcm_len, int max_sec)
@@ -234,12 +215,13 @@ void cache_put(const char *path, const WAVEFORMATEX *fmt, const BYTE *pcm, DWORD
 
 /* Music BGM: shared PCM cache with byte budget (32-bit: full-folder preload OOM'd tpw*). */
 enum { MUSIC_CACHE_N = 12 };
-enum { MUSIC_CACHE_MAX_BYTES = 160u * 1024u * 1024u };
+enum { MUSIC_CACHE_MAX_BYTES = 96u * 1024u * 1024u };
 typedef struct {
     char path[260];
     BYTE *pcm;
     DWORD pcm_bytes;
     WAVEFORMATEX fmt;
+    LONG refs;
 } MusicCacheEnt;
 static MusicCacheEnt g_music_cache[MUSIC_CACHE_N];
 static int g_music_cache_n;
@@ -282,20 +264,27 @@ static void music_path_key(const char *in, char *out, size_t n)
     out[j] = '\0';
 }
 
-static void music_cache_evict_one_unlocked(void)
+static int music_cache_evict_one_unlocked(void)
 {
     int i;
     if (g_music_cache_n <= 0)
-        return;
-    free(g_music_cache[0].pcm);
-    if (g_music_cache_bytes >= g_music_cache[0].pcm_bytes)
-        g_music_cache_bytes -= g_music_cache[0].pcm_bytes;
+        return 0;
+    for (i = 0; i < g_music_cache_n; ++i) {
+        if (g_music_cache[i].refs == 0)
+            break;
+    }
+    if (i >= g_music_cache_n)
+        return 0;
+    free(g_music_cache[i].pcm);
+    if (g_music_cache_bytes >= g_music_cache[i].pcm_bytes)
+        g_music_cache_bytes -= g_music_cache[i].pcm_bytes;
     else
         g_music_cache_bytes = 0;
-    for (i = 1; i < g_music_cache_n; ++i)
+    for (++i; i < g_music_cache_n; ++i)
         g_music_cache[i - 1] = g_music_cache[i];
     g_music_cache_n--;
     memset(&g_music_cache[g_music_cache_n], 0, sizeof(g_music_cache[0]));
+    return 1;
 }
 
 int music_cache_get(const char *path, WAVEFORMATEX *fmt, BYTE **pcm, DWORD *pcm_bytes)
@@ -329,6 +318,29 @@ int music_cache_get(const char *path, WAVEFORMATEX *fmt, BYTE **pcm, DWORD *pcm_
     return found;
 }
 
+int music_cache_acquire(const char *path, WAVEFORMATEX *fmt, BYTE **pcm, DWORD *pcm_bytes)
+{
+    char key[260];
+    int i, found = 0;
+    if (!path || !fmt || !pcm || !pcm_bytes)
+        return 0;
+    music_path_key(path, key, sizeof(key));
+    music_cache_ensure_cs();
+    EnterCriticalSection(&g_music_cs);
+    for (i = 0; i < g_music_cache_n; ++i) {
+        if (strcmp(g_music_cache[i].path, key) == 0) {
+            *fmt = g_music_cache[i].fmt;
+            *pcm = g_music_cache[i].pcm;
+            *pcm_bytes = g_music_cache[i].pcm_bytes;
+            InterlockedIncrement(&g_music_cache[i].refs);
+            found = 1;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_music_cs);
+    return found;
+}
+
 BYTE *music_cache_intern(const char *path, const WAVEFORMATEX *fmt, BYTE *pcm, DWORD pcm_bytes)
 {
     char key[260];
@@ -350,8 +362,10 @@ BYTE *music_cache_intern(const char *path, const WAVEFORMATEX *fmt, BYTE *pcm, D
     }
     while (g_music_cache_n > 0 &&
            (g_music_cache_n >= MUSIC_CACHE_N ||
-            g_music_cache_bytes + pcm_bytes > MUSIC_CACHE_MAX_BYTES))
-        music_cache_evict_one_unlocked();
+            g_music_cache_bytes + pcm_bytes > MUSIC_CACHE_MAX_BYTES)) {
+        if (!music_cache_evict_one_unlocked())
+            break;
+    }
     if (g_music_cache_n >= MUSIC_CACHE_N ||
         g_music_cache_bytes + pcm_bytes > MUSIC_CACHE_MAX_BYTES) {
         /* Still no room for this track alone — leave caller-owned. */
@@ -370,7 +384,103 @@ BYTE *music_cache_intern(const char *path, const WAVEFORMATEX *fmt, BYTE *pcm, D
     return ret;
 }
 
-BYTE *music_cache_upgrade(const char *path, const WAVEFORMATEX *fmt, BYTE *pcm, DWORD pcm_bytes)
+BYTE *music_cache_intern_acquire(const char *path, const WAVEFORMATEX *fmt, BYTE *pcm,
+                                 DWORD pcm_bytes, int *cached)
+{
+    char key[260];
+    int i;
+    if (cached)
+        *cached = 0;
+    if (!path || !fmt || !pcm || !pcm_bytes)
+        return pcm;
+    music_path_key(path, key, sizeof(key));
+    music_cache_ensure_cs();
+    EnterCriticalSection(&g_music_cs);
+    for (i = 0; i < g_music_cache_n; ++i) {
+        if (strcmp(g_music_cache[i].path, key) == 0) {
+            if (g_music_cache[i].pcm != pcm)
+                free(pcm);
+            InterlockedIncrement(&g_music_cache[i].refs);
+            pcm = g_music_cache[i].pcm;
+            if (cached)
+                *cached = 1;
+            LeaveCriticalSection(&g_music_cs);
+            return pcm;
+        }
+    }
+    while (g_music_cache_n > 0 &&
+           (g_music_cache_n >= MUSIC_CACHE_N ||
+            g_music_cache_bytes + pcm_bytes > MUSIC_CACHE_MAX_BYTES)) {
+        if (!music_cache_evict_one_unlocked())
+            break;
+    }
+    if (g_music_cache_n < MUSIC_CACHE_N &&
+        g_music_cache_bytes + pcm_bytes <= MUSIC_CACHE_MAX_BYTES) {
+        MusicCacheEnt *ent = &g_music_cache[g_music_cache_n++];
+        memset(ent, 0, sizeof(*ent));
+        strncpy(ent->path, key, sizeof(ent->path) - 1);
+        ent->fmt = *fmt;
+        ent->pcm = pcm;
+        ent->pcm_bytes = pcm_bytes;
+        ent->refs = 1;
+        g_music_cache_bytes += pcm_bytes;
+        if (cached)
+            *cached = 1;
+    }
+    LeaveCriticalSection(&g_music_cs);
+    return pcm;
+}
+
+int music_cache_retain(const char *path, const BYTE *pcm)
+{
+    char key[260];
+    int i, found = 0;
+    if (!path || !pcm)
+        return 0;
+    music_path_key(path, key, sizeof(key));
+    music_cache_ensure_cs();
+    EnterCriticalSection(&g_music_cs);
+    for (i = 0; i < g_music_cache_n; ++i) {
+        if (g_music_cache[i].pcm == pcm && strcmp(g_music_cache[i].path, key) == 0) {
+            InterlockedIncrement(&g_music_cache[i].refs);
+            found = 1;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_music_cs);
+    return found;
+}
+
+void music_cache_release(const char *path, const BYTE *pcm)
+{
+    char key[260];
+    int i;
+    if (!path || !pcm)
+        return;
+    music_path_key(path, key, sizeof(key));
+    music_cache_ensure_cs();
+    EnterCriticalSection(&g_music_cs);
+    for (i = 0; i < g_music_cache_n; ++i) {
+        if (g_music_cache[i].pcm == pcm && strcmp(g_music_cache[i].path, key) == 0) {
+            if (g_music_cache[i].refs > 0)
+                InterlockedDecrement(&g_music_cache[i].refs);
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_music_cs);
+}
+
+void music_cache_collect(void)
+{
+    music_cache_ensure_cs();
+    EnterCriticalSection(&g_music_cs);
+    while (music_cache_evict_one_unlocked()) {
+    }
+    LeaveCriticalSection(&g_music_cs);
+}
+
+static BYTE *music_cache_upgrade(const char *path, const WAVEFORMATEX *fmt, BYTE *pcm,
+                                 DWORD pcm_bytes)
 {
     char key[260];
     int i;
@@ -389,11 +499,20 @@ BYTE *music_cache_upgrade(const char *path, const WAVEFORMATEX *fmt, BYTE *pcm, 
                 LeaveCriticalSection(&g_music_cs);
                 return ret;
             }
-            /* Larger buffer wins. Old head may still be referenced by a live segment — leak it. */
+            /* Never replace storage while a CkSegment references it. */
+            if (g_music_cache[i].refs > 0) {
+                if (g_music_cache[i].pcm != pcm)
+                    free(pcm);
+                ret = g_music_cache[i].pcm;
+                LeaveCriticalSection(&g_music_cs);
+                return ret;
+            }
             if (g_music_cache_bytes >= g_music_cache[i].pcm_bytes)
                 g_music_cache_bytes -= g_music_cache[i].pcm_bytes;
             else
                 g_music_cache_bytes = 0;
+            if (g_music_cache[i].pcm != pcm)
+                free(g_music_cache[i].pcm);
             g_music_cache[i].fmt = *fmt;
             g_music_cache[i].pcm = pcm;
             g_music_cache[i].pcm_bytes = pcm_bytes;
@@ -462,7 +581,7 @@ static DWORD WINAPI music_prefetch_full_proc(void *arg)
     return 0;
 }
 
-void music_prefetch_full_async(const char *path)
+static void music_prefetch_full_async(const char *path)
 {
     char key[260];
     char *dup;
@@ -972,14 +1091,6 @@ HRESULT load_wav_file_or_pak(const char *path, BYTE **out, DWORD *out_len)
     *out = buf;
     *out_len = sz;
     return S_OK;
-}
-
-HRESULT read_istream_all(void *stream, BYTE **out, DWORD *out_len)
-{
-    (void)stream;
-    *out = NULL;
-    *out_len = 0;
-    return E_NOTIMPL; /* game stream is not stdcall IStream — never call it */
 }
 
 static HRESULT load_audio_from_stream(void *stream, BYTE **out, DWORD *out_len, char *path_out,

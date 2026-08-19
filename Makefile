@@ -197,4 +197,4 @@ install-i2: all
 	  fi; \
 	fi
 	@echo "installed $(GAME_DIR_I2)/scripts/CK.asi + $(GAME_DIR_I2)/winmm.dll"
-	@echo "  WINEDLLOVERRIDES='winmm=n,b'  CK_DM_REPLACE=1"
+	@echo "  WINEDLLOVERRIDES='winmm=n,b'  (dm-replace ON by default)"

@@ -22,9 +22,6 @@
 #include <ctype.h>
 
 enum {
-    OGG_DECODE_MAX_SEC = 30,
-    /* Deprecated: head-only music truncates the DS buffer (~16s). Always use FULL for BGM. */
-    OGG_DECODE_MUSIC_HEAD_SEC = 16,
     OGG_DECODE_FULL = -1
 };
 
@@ -65,7 +62,7 @@ enum {
 
 #define CK_DMUS_PMSGT_NOTIFICATION 3u
 #define CK_DMUS_NOTIFICATION_SEGEND 1u
-#define CK_NOTIF_SLOTS 32
+#define CK_NOTIF_SLOTS 128
 
 #define CK_CAM_PTR_VA 0x007CA604u
 #define CK_CAM_LEFT_OFF 0x4C8u
@@ -93,7 +90,9 @@ typedef struct {
     WAVEFORMATEX fmt;
     void *last_path;
     DWORD repeats;
-    char path[200];
+    int pcm_cached;
+    int unloaded;
+    char path[260];
 } CkSegment;
 
 typedef struct {
@@ -105,6 +104,7 @@ typedef struct {
     void *ctrl_proxy;
     LONG vol;
     LONG pan;
+    int active;
 } CkPath;
 
 typedef struct {
@@ -156,6 +156,9 @@ typedef struct {
     LPDIRECTSOUND ds;
     LPDIRECTSOUNDBUFFER primary;
     LPDIRECTSOUNDBUFFER music_buf;
+    CkSegment *music_seg;
+    DWORD music_path_id;
+    DWORD clock_start_ms;
     HWND hwnd;
     CRITICAL_SECTION lock;
     HANDLE notif_event;
@@ -242,21 +245,21 @@ int path_want_spatial(const char *p);
 /* ---- assets / decode ---- */
 int decode_to_pcm(const BYTE *raw, DWORD raw_len, WAVEFORMATEX *fmt, BYTE **pcm_out,
                   DWORD *pcm_len, int max_sec);
-int make_silent_pcm(WAVEFORMATEX *fmt, BYTE **pcm_out, DWORD *pcm_len);
 int cache_get(const char *path, WAVEFORMATEX *fmt, BYTE **pcm, DWORD *pcm_bytes);
 void cache_put(const char *path, const WAVEFORMATEX *fmt, const BYTE *pcm, DWORD pcm_bytes);
 int music_cache_get(const char *path, WAVEFORMATEX *fmt, BYTE **pcm, DWORD *pcm_bytes);
+int music_cache_acquire(const char *path, WAVEFORMATEX *fmt, BYTE **pcm, DWORD *pcm_bytes);
 BYTE *music_cache_intern(const char *path, const WAVEFORMATEX *fmt, BYTE *pcm, DWORD pcm_bytes);
-/* Replace cache entry when new PCM is larger (old buffer leaked if still referenced). */
-BYTE *music_cache_upgrade(const char *path, const WAVEFORMATEX *fmt, BYTE *pcm, DWORD pcm_bytes);
-/* Background full-track decode after a head decode on the main thread. */
-void music_prefetch_full_async(const char *path);
+BYTE *music_cache_intern_acquire(const char *path, const WAVEFORMATEX *fmt, BYTE *pcm,
+                                 DWORD pcm_bytes, int *cached);
+int music_cache_retain(const char *path, const BYTE *pcm);
+void music_cache_release(const char *path, const BYTE *pcm);
+void music_cache_collect(void);
 void music_preload_start(void);
 void ensure_game_dir(void);
 const char *dm_game_dir(void);
 int scrape_stream_path(void *stream, char *out, size_t outn);
 HRESULT load_wav_file_or_pak(const char *path, BYTE **out, DWORD *out_len);
-HRESULT read_istream_all(void *stream, BYTE **out, DWORD *out_len);
 
 /* ---- voice / spatial / play ---- */
 void install_onscreen_pan_fix(void);
@@ -275,11 +278,14 @@ void path_stop_live_sfx(DWORD path_id);
 void live_cs_enter(void);
 void live_cs_leave(void);
 void live_free_slot(int i);
+int segment_is_playing(CkSegment *seg);
 HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags);
 
 /* ---- COM ---- */
 void init_vtables(void);
 void notif_schedule_segend(CkPerf *perf, CkState *st, DWORD dur_ms);
 void state_init(CkState *st, CkSegment *seg, DWORD repeats);
+ULONG ck_segment_addref(CkSegment *seg);
+ULONG ck_segment_release(CkSegment *seg);
 
 #endif /* CK_DM_REPLACE_INTERNAL_H */
