@@ -76,7 +76,6 @@ endif
 lib_stb_vorbis = static_library('stb_vorbis', 'stb_vorbis.c',
   c_args : win_defs_xp + c_warn + [
     '-DSTB_VORBIS_NO_STDIO',
-    '-DSTB_VORBIS_MAX_CHANNELS=2',
     '-Wno-unused-parameter', '-Wno-unused-value', '-Wno-maybe-uninitialized',
   ],
   include_directories : src_inc,

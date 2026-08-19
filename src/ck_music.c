@@ -345,9 +345,7 @@ int ck_music_play(const char *path, int loop, LONG vol_mb)
         return 0;
     }
     vi = stb_vorbis_get_info(v);
-    if (vi.channels < 1 || vi.channels > 2 || vi.sample_rate < 1) {
-        if (vi.channels > 2)
-            log_msg("ck_music: reject %dch OGG '%s' (max 2)", vi.channels, path);
+    if (vi.channels < 1 || vi.sample_rate < 1) {
         stb_vorbis_close(v);
         free(data);
         return 0;

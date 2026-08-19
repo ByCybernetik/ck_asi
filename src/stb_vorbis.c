@@ -5132,7 +5132,7 @@ stb_vorbis * stb_vorbis_open_memory(const unsigned char *data, int len, int *err
 #define C  (PLAYBACK_LEFT  | PLAYBACK_RIGHT | PLAYBACK_MONO)
 #define R  (PLAYBACK_RIGHT | PLAYBACK_MONO)
 
-static int8 channel_position[7][6] =
+static int8 channel_position[17][16] =
 {
    { 0 },
    { C },
@@ -5141,6 +5141,16 @@ static int8 channel_position[7][6] =
    { L, R, L, R },
    { L, C, R, L, R },
    { L, C, R, L, R, C },
+   { L, C, R, L, R, 0, C },
+   { L, C, R, L, R, 0, 0, C },
+   { L, C, R, L, R, 0, 0, 0, C },
+   { L, C, R, L, R, 0, 0, 0, 0, C },
+   { L, C, R, L, R, 0, 0, 0, 0, 0, C },
+   { L, C, R, L, R, 0, 0, 0, 0, 0, 0, C },
+   { L, C, R, L, R, 0, 0, 0, 0, 0, 0, 0, C },
+   { L, C, R, L, R, 0, 0, 0, 0, 0, 0, 0, 0, C },
+   { L, C, R, L, R, 0, 0, 0, 0, 0, 0, 0, 0, 0, C },
+   { L, C, R, L, R, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, C },
 };
 
 
@@ -5244,7 +5254,7 @@ static void compute_stereo_samples(short *output, int num_c, float **data, int d
 static void convert_samples_short(int buf_c, short **buffer, int b_offset, int data_c, float **data, int d_offset, int samples)
 {
    int i;
-   if (buf_c != data_c && buf_c <= 2 && data_c <= 6) {
+   if (buf_c != data_c && buf_c <= 2 && data_c <= 16) {
       static int channel_selector[3][2] = { {0}, {PLAYBACK_MONO}, {PLAYBACK_LEFT, PLAYBACK_RIGHT} };
       for (i=0; i < buf_c; ++i)
          compute_samples(channel_selector[buf_c][i], buffer[i]+b_offset, data_c, data, d_offset, samples);
@@ -5271,7 +5281,7 @@ static void convert_channels_short_interleaved(int buf_c, short *buffer, int dat
 {
    int i;
    check_endianness();
-   if (buf_c != data_c && buf_c <= 2 && data_c <= 6) {
+   if (buf_c != data_c && buf_c <= 2 && data_c <= 16) {
       assert(buf_c == 2);
       for (i=0; i < buf_c; ++i)
          compute_stereo_samples(buffer, data_c, data, d_offset, len);
