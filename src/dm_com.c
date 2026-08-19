@@ -1408,7 +1408,9 @@ static HRESULT STDMETHODCALLTYPE perf_PlaySegmentEx(CkPerf *This, void *source, 
 
     ck_ring_push(6, 45);
 
-    if (!seg || !seg->pcm)
+    if (!seg)
+        return E_INVALIDARG;
+    if (!seg->pcm && !path_is_music(seg->path))
         return E_INVALIDARG;
     if (!seg->last_path && path)
         segment_set_path(seg, path);
