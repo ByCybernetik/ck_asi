@@ -15,9 +15,10 @@ if not gpu_scene
 endif
 
 # --- FreeType -------------------------------------------------------------
-# Build from the third_party submodule through Meson subprojects.
+# Always build statically from third_party — no libfreetype-6.dll at runtime.
 
-ft_dep = dependency('freetype2', fallback : ['freetype2', 'freetype_dep'])
+ft_sub = subproject('freetype2', default_options : ['default_library=static'])
+ft_dep = ft_sub.get_variable('freetype_dep')
 
 # --- Include directories -------------------------------------------------
 
@@ -147,7 +148,7 @@ shared_library('CK',
   c_args : win_defs_xp + c_warn,
   include_directories : asi_inc,
   link_with : special_libs,
-  dependencies : win_libs + [ft_dep],
+  dependencies : win_libs,
   link_args : ['-Wl,--kill-at', '-Wl,--enable-stdcall-fix'],
 )
 

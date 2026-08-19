@@ -6,6 +6,7 @@ project('ck_asi', ['c', 'cpp'],
     'optimization=2',
     'warning_level=2',
     'strip=true',
+    'default_library=static',
   ],
 )
 
