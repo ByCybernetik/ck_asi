@@ -16,12 +16,9 @@ if not gpu_scene
 endif
 
 # --- FreeType -------------------------------------------------------------
-# Headers from third_party submodule; prebuilt lib from deps/freetype/lib.
+# Build from the third_party submodule through Meson subprojects.
 
-ft_inc = include_directories('../third_party/freetype/include')
-ft_lib = cc.find_library('freetype', dirs : [
-  meson.project_source_root() / 'deps' / 'freetype' / 'lib',
-])
+ft_dep = dependency('freetype2', fallback : ['freetype2', 'freetype_dep'])
 
 # --- Include directories -------------------------------------------------
 
@@ -92,7 +89,8 @@ lib_stb_vorbis = static_library('stb_vorbis', 'stb_vorbis.c',
 
 lib_tip_font = static_library('tip_font', 'tip_font.c',
   c_args : win_defs_xp + c_warn + ['-fno-ipa-cp-clone'],
-  include_directories : [src_inc, ft_inc],
+  include_directories : src_inc,
+  dependencies : [ft_dep],
 )
 
 vk_c_args = win_defs_xp + c_warn + vk_flags
@@ -187,7 +185,7 @@ shared_library('CK',
   c_args : win_defs_xp + c_warn,
   include_directories : src_inc,
   link_with : special_libs,
-  dependencies : win_libs + [ft_lib],
+  dependencies : win_libs + [ft_dep],
   link_args : ['-Wl,--kill-at', '-Wl,--enable-stdcall-fix'],
 )
 
