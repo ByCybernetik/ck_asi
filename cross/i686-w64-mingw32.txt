@@ -12,6 +12,7 @@ cpu        = 'i686'
 endian     = 'little'
 
 [built-in options]
+default_library = 'static'
 c_args      = ['-mcrtdll=msvcrt-os']
 cpp_args    = ['-std=c++17', '-fno-exceptions', '-fno-rtti']
 c_link_args = ['-static-libgcc']
