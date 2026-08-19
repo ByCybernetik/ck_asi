@@ -226,9 +226,9 @@ int audio_wasapi_init(HWND hwnd)
     WasapiState *s = &g_wasapi;
     const char *backend = getenv("CK_AUDIO_BACKEND");
     (void)hwnd;
-    if (backend && backend[0]) {
-        if (backend[0] == 'd' || backend[0] == 'D')
-            return 0;
+    if (!backend || !backend[0] || !(backend[0] == 'w' || backend[0] == 'W')) {
+        log_msg("dm-replace: WASAPI disabled (set CK_AUDIO_BACKEND=wasapi to enable)");
+        return 0;
     }
     if (s->client && s->thread)
         return 1;
@@ -334,8 +334,10 @@ int audio_wasapi_play_ogg(const BYTE *ogg_data, DWORD ogg_len, int loop, LONG vo
     int need;
     BYTE *copy;
 
-    if (!s->thread || !ogg_data || !ogg_len)
+    if (!s->thread || !ogg_data || !ogg_len) {
+        log_msg("dm-replace: WASAPI play rejected thread=%p len=%lu", (void*)s->thread, (unsigned long)ogg_len);
         return 0;
+    }
 
     copy = (BYTE *)malloc(ogg_len);
     if (!copy)
@@ -344,6 +346,7 @@ int audio_wasapi_play_ogg(const BYTE *ogg_data, DWORD ogg_len, int loop, LONG vo
 
     v = stb_vorbis_open_memory(copy, (int)ogg_len, &err, NULL);
     if (!v) {
+        log_msg("dm-replace: WASAPI stb_vorbis_open_memory failed len=%lu err=%d", (unsigned long)ogg_len, err);
         free(copy);
         return 0;
     }

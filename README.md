@@ -97,7 +97,7 @@ loaders as `winmm.dll` at once.
 | `CK_GDI_FALLBACK=1` | Disable Vulkan present |
 | `CK_DM_NATIVE=0` | Disable game-dir DirectMusic CoCreate redirect |
 | `CK_DM_REPLACE=0` | Disable DirectMusic stub; use native/Wine DirectMusic (default: **replace** with DirectSound stub) |
-| `CK_AUDIO_BACKEND=dsound` | Force legacy DirectSound music backend (default tries WASAPI, falls back to DSound) |
+| `CK_AUDIO_BACKEND=wasapi` | Enable experimental WASAPI music backend (default: DirectSound) |
 | `CK_PROXY_PROFILE=full` | Extra Wait/Sleep/terrain debug hooks (can freeze) |
 | `CK_PROXY_PROFILE=min` | Default: slim hook set |
 
