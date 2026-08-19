@@ -1662,40 +1662,6 @@ static HRESULT STDMETHODCALLTYPE ldr_GetObject(CkLoader *This, void *pDesc, REFI
         return E_FAIL;
     }
 
-    /*
-     * WASAPI streaming: music segments skip full decode — WASAPI render thread
-     * decodes OGG on the fly via stb_vorbis_get_samples_short_interleaved.
-     * Create a lightweight segment with just the path; play_pcm_music_wasapi
-     * will load the raw OGG and hand it to audio_wasapi_play_ogg.
-     */
-    {
-        CkPerf *wasapi_perf = NULL;
-        live_cs_enter();
-        wasapi_perf = g_active_perf;
-        live_cs_leave();
-        if (wasapi_perf && wasapi_perf->music_wasapi && path_is_music(scraped)) {
-            seg = (CkSegment *)calloc(1, sizeof(*seg));
-            if (!seg)
-                return E_OUTOFMEMORY;
-            seg->lpVtbl = g_seg_vt;
-            seg->refs = 1;
-            memset(&seg->fmt, 0, sizeof(seg->fmt));
-            seg->fmt.wFormatTag = WAVE_FORMAT_PCM;
-            seg->fmt.nChannels = 2;
-            seg->fmt.nSamplesPerSec = 44100;
-            seg->fmt.wBitsPerSample = 16;
-            seg->fmt.nBlockAlign = 4;
-            seg->fmt.nAvgBytesPerSec = 44100 * 4;
-            seg->pcm = NULL;
-            seg->pcm_bytes = 0;
-            strncpy(seg->path, scraped, sizeof(seg->path) - 1);
-            segment_register(seg);
-            *ppv = seg;
-            dm_agent("R2", "dm_replace.c:GetObject", "get-object-wasapi", "{\"streaming\":1}");
-            return S_OK;
-        }
-    }
-
     /* Music: shared full-PCM cache (H-AUD). SFX: small copy cache. */
     if (path_is_music(scraped) && music_cache_acquire(scraped, &fmt, &pcm_buf, &pcm_len)) {
         pcm_cached = 1;

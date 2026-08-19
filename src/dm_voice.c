@@ -1490,15 +1490,15 @@ static HRESULT play_pcm_music_wasapi(CkPerf *perf, CkSegment *seg, CkPath *apath
 
     if (FAILED(load_wav_file_or_pak(seg->path, &raw, &raw_len)) || !raw || raw_len < 4) {
         free(raw);
-        return E_FAIL;
+        return E_NOTIMPL;
     }
     if (memcmp(raw, "OggS", 4) != 0) {
         free(raw);
-        return E_FAIL;
+        return E_NOTIMPL;
     }
     if (!audio_wasapi_play_ogg(raw, raw_len, loop_play, pvol, &dur_ms)) {
         free(raw);
-        return E_FAIL;
+        return E_NOTIMPL;
     }
 
     EnterCriticalSection(&perf->lock);
@@ -1512,14 +1512,9 @@ static HRESULT play_pcm_music_wasapi(CkPerf *perf, CkSegment *seg, CkPath *apath
     music_release_old(old_buf, old_seg, fade_transition, pvol);
 
     if (dur_ms < 1000u)
-        dur_ms = 180000u;
-    seg->fmt.wFormatTag = WAVE_FORMAT_PCM;
-    seg->fmt.nChannels = 2;
-    seg->fmt.nSamplesPerSec = 1000;
-    seg->fmt.wBitsPerSample = 16;
-    seg->fmt.nBlockAlign = 2;
-    seg->fmt.nAvgBytesPerSec = 1000;
-    seg->pcm_bytes = dur_ms;
+        dur_ms = seg->fmt.nAvgBytesPerSec
+                     ? (DWORD)((ULONGLONG)seg->pcm_bytes * 1000ull / seg->fmt.nAvgBytesPerSec)
+                     : 180000u;
     music_note_started(seg->path, loop_play, dur_ms, pvol, 0);
     return S_OK;
 }
@@ -1629,13 +1624,20 @@ HRESULT play_pcm(CkPerf *perf, CkSegment *seg, CkPath *apath, DWORD flags)
     pvol = apath ? InterlockedCompareExchange(&apath->vol, 0, 0) : 0;
 
     if (is_music) {
-        if (perf->music_wasapi)
-            return play_pcm_music_wasapi(perf, seg, apath, flags, pvol);
+        if (perf->music_wasapi) {
+            HRESULT whr = play_pcm_music_wasapi(perf, seg, apath, flags, pvol);
+            if (whr != E_NOTIMPL)
+                return whr;
+            perf->music_wasapi = 0;
+            log_msg("dm-replace: WASAPI play failed, falling back to DirectSound");
+        }
+        {
         LPDIRECTSOUNDBUFFER cached = NULL;
         music_cache_build_ds_for_path(perf->ds, seg->path);
         if (music_cache_try_acquire_ds_buf(seg->path, &cached) && cached)
             return play_pcm_music_start(perf, seg, apath, flags, pvol, cached, loop_play);
         return music_play_async(perf, seg, apath, flags, pvol);
+        }
     }
 
     if (!seg->pcm || !seg->pcm_bytes)
