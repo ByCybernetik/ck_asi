@@ -21,6 +21,7 @@ extern int stb_vorbis_get_samples_short_interleaved(stb_vorbis *f, int channels,
                                                     int num_shorts);
 extern int stb_vorbis_decode_memory(const unsigned char *mem, int len, int *channels,
                                     int *sample_rate, short **output);
+extern int stb_vorbis_get_frame_short_interleaved(stb_vorbis *f, int num_c, short *buffer, int num_shorts);
 extern void stb_vorbis_close(stb_vorbis *f);
 
 static int parse_wav(const BYTE *data, DWORD size, WAVEFORMATEX *fmt, const BYTE **pcm, DWORD *pcm_len)
