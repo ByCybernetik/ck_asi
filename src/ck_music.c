@@ -75,9 +75,16 @@ static int ckm_decode_more(CkMusicPlayer *p)
 {
     int got;
     if (!p->vorbis) return 0;
+    /*
+     * Always request CKM_OUT_CH (stereo) output regardless of source channel
+     * count.  stb_vorbis performs the downmix internally when the requested
+     * channel count differs from the file's.  This avoids allocating huge
+     * decode buffers for multichannel OGGs (some game files report 6-8ch)
+     * and prevents internal stb_vorbis OOM → NULL channel_buffer → crash.
+     */
     got = stb_vorbis_get_samples_short_interleaved(
-        p->vorbis, p->src_ch, p->decode_tmp,
-        CKM_DECODE_FRAMES * p->src_ch);
+        p->vorbis, CKM_OUT_CH, p->decode_tmp,
+        CKM_DECODE_FRAMES * CKM_OUT_CH);
     if (got <= 0) return 0;
     p->decode_pos = 0;
     p->decode_len = got;
@@ -99,13 +106,9 @@ static void ckm_read_sample(CkMusicPlayer *p, float *l, float *r)
         }
     }
     {
-        int idx = p->decode_pos * p->src_ch;
-        if (p->src_ch >= 2) {
-            *l = (float)p->decode_tmp[idx]     / 32768.0f;
-            *r = (float)p->decode_tmp[idx + 1] / 32768.0f;
-        } else {
-            *l = *r = (float)p->decode_tmp[idx] / 32768.0f;
-        }
+        int idx = p->decode_pos * CKM_OUT_CH;
+        *l = (float)p->decode_tmp[idx]     / 32768.0f;
+        *r = (float)p->decode_tmp[idx + 1] / 32768.0f;
     }
 }
 

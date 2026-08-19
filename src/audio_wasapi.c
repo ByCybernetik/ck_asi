@@ -68,9 +68,11 @@ static int wasapi_decode_more(WasapiState *s)
     int got;
     if (!s->vorbis)
         return 0;
+    /* Always decode to stereo — stb_vorbis handles the downmix.
+     * Prevents OOM / NULL channel_buffer crash with multichannel OGGs. */
     got = stb_vorbis_get_samples_short_interleaved(
-        s->vorbis, s->vorbis_ch, s->decode_buf,
-        DECODE_CHUNK * s->vorbis_ch);
+        s->vorbis, 2, s->decode_buf,
+        DECODE_CHUNK * 2);
     if (got <= 0)
         return 0;
     s->decode_buf_pos = 0;
@@ -80,7 +82,7 @@ static int wasapi_decode_more(WasapiState *s)
 
 static void wasapi_read_frame(WasapiState *s, float *l, float *r)
 {
-    int idx, vch;
+    int idx;
     short *buf;
 
     *l = 0.0f;
@@ -101,16 +103,10 @@ static void wasapi_read_frame(WasapiState *s, float *l, float *r)
         }
     }
 
-    vch = s->vorbis_ch;
     buf = s->decode_buf;
-    idx = s->decode_buf_pos * vch;
-
-    if (vch >= 2) {
-        *l = (float)buf[idx + 0] / 32768.0f;
-        *r = (float)buf[idx + 1] / 32768.0f;
-    } else {
-        *l = *r = (float)buf[idx] / 32768.0f;
-    }
+    idx = s->decode_buf_pos * 2;
+    *l = (float)buf[idx + 0] / 32768.0f;
+    *r = (float)buf[idx + 1] / 32768.0f;
 }
 
 static void wasapi_fill(BYTE *dst, UINT32 frames)
@@ -374,7 +370,8 @@ int audio_wasapi_play_ogg(const BYTE *ogg_data, DWORD ogg_len, int loop, LONG vo
     }
 
     EnterCriticalSection(&s->lock);
-    need = DECODE_CHUNK * vi.channels;
+    /* We always decode to stereo, so buffer only needs DECODE_CHUNK*2. */
+    need = DECODE_CHUNK * 2;
     if (need > s->decode_buf_cap) {
         short *nb = (short *)realloc(s->decode_buf, (size_t)need * sizeof(short));
         if (!nb) {
